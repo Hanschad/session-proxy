@@ -1,0 +1,12 @@
+# Binaries
+session-proxy
+
+# OS specific
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Agent
+.gemini/
