@@ -75,6 +75,13 @@ func main() {
 	// We still defer Close in case of normal exit, though Close is idempotent-ish
 	defer adapter.Close()
 
+	// 2.5 Wait for SSM handshake to complete
+	log.Println("Waiting for SSM handshake...")
+	if err := adapter.WaitForHandshake(ctx); err != nil {
+		log.Fatalf("SSM handshake failed: %v", err)
+	}
+	log.Println("SSM handshake completed")
+
 	// 3. Establish SSH Connection
 	log.Printf("Establishing SSH connection as user '%s'...", *sshUser)
 	sshClient, err := ssh.Connect(adapter, ssh.Config{

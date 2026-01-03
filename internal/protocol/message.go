@@ -16,6 +16,7 @@ const (
 	MsgTypeOutputStreamData = "output_stream_data"
 	MsgTypeInputStreamData  = "input_stream_data"
 	MsgTypeAcknowledge      = "acknowledge"
+	MsgTypeChannelClosed    = "channel_closed"
 
 	SchemaVersion = 1
 
@@ -31,13 +32,32 @@ const (
 	PayloadTypeLen    = 4
 	PayloadLengthLen  = 4
 
+	// TotalHeaderLen is the full binary header size (used for serialization offset)
 	TotalHeaderLen = HeaderLen + MessageTypeLen + SchemaVersionLen + CreatedDateLen + SequenceNumberLen + FlagsLen + MessageIdLen + PayloadDigestLen + PayloadTypeLen + PayloadLengthLen
 
-	// AgentMessageFlag values
-	DataFlag = 0
-	SynFlag  = 1
-	FinFlag  = 2
-	AckFlag  = 3
+	// HeaderLengthValue is the value to put in the HeaderLength field
+	// Per AWS plugin: payload offset = HeaderLength + 4 (PayloadLengthLength)
+	// So HeaderLength = offset to PayloadLength field, NOT to Payload
+	HeaderLengthValue = HeaderLen + MessageTypeLen + SchemaVersionLen + CreatedDateLen + SequenceNumberLen + FlagsLen + MessageIdLen + PayloadDigestLen + PayloadTypeLen
+
+	// AgentMessageFlag values (bitmask for stream control)
+	FlagData = 0 // Normal data
+	FlagSyn  = 1 // Stream start (bit 0)
+	FlagFin  = 2 // Stream end (bit 1)
+
+	// PayloadType values
+	PayloadTypeOutput                  uint32 = 1
+	PayloadTypeError                   uint32 = 2
+	PayloadTypeSize                    uint32 = 3
+	PayloadTypeParameter               uint32 = 4
+	PayloadTypeHandshakeRequest        uint32 = 5
+	PayloadTypeHandshakeResponse       uint32 = 6
+	PayloadTypeHandshakeComplete       uint32 = 7
+	PayloadTypeEncChallengeRequest     uint32 = 8
+	PayloadTypeEncChallengeResponse    uint32 = 9
+	PayloadTypeFlag                    uint32 = 10
+	PayloadTypeStdErr                  uint32 = 11
+	PayloadTypeExitCode                uint32 = 12
 )
 
 type AgentMessage struct {
@@ -62,45 +82,38 @@ func NewInputMessage(payload []byte, seq int64) (*AgentMessage, error) {
 	id := uuid.New()
 	return &AgentMessage{
 		Header: AgentMessageHeader{
-			HeaderLength:   uint32(TotalHeaderLen),
+			HeaderLength:   uint32(HeaderLengthValue),
 			MessageType:    MsgTypeInputStreamData,
 			SchemaVersion:  SchemaVersion,
 			CreatedDate:    uint64(time.Now().UnixMilli()),
 			SequenceNumber: seq,
-			Flags:          DataFlag,
+			Flags:          FlagData,
 			MessageId:      id,
-			PayloadType:    1, // 1 for normal data? implicit from docs
+			PayloadType:    PayloadTypeOutput,
 			PayloadLength:  uint32(len(payload)),
 		},
 		Payload: payload,
 	}, nil
 }
 
-func NewAcknowledgeMessage(refMsgId uuid.UUID, refSeq int64, seq int64) (*AgentMessage, error) {
-	// Acknowledge payload format reversed from server logs:
-	// [4 bytes length][JSON]
-	// JSON: {"AcknowledgedMessageType":"output_stream_data","AcknowledgedMessageId":"...","AcknowledgedMessageSequenceNumber":...,"IsSequentialMessage":true}
-
-	ackJson := fmt.Sprintf(`{"AcknowledgedMessageType":"output_stream_data","AcknowledgedMessageId":"%s","AcknowledgedMessageSequenceNumber":%d,"IsSequentialMessage":true}`, refMsgId.String(), refSeq)
-	jsonBytes := []byte(ackJson)
-
-	payloadBuf := new(bytes.Buffer)
-	binary.Write(payloadBuf, binary.BigEndian, uint32(len(jsonBytes)))
-	payloadBuf.Write(jsonBytes)
-
-	payloadBytes := payloadBuf.Bytes()
+func NewAcknowledgeMessage(refMsgType string, refMsgId uuid.UUID, refSeq int64) (*AgentMessage, error) {
+	// ACK payload is pure JSON (no internal length prefix)
+	// Agent uses Flags=3 and PayloadType=0 for ACK messages
+	ackJson := fmt.Sprintf(`{"AcknowledgedMessageType":"%s","AcknowledgedMessageId":"%s","AcknowledgedMessageSequenceNumber":%d,"IsSequentialMessage":true}`,
+		refMsgType, refMsgId.String(), refSeq)
+	payloadBytes := []byte(ackJson)
 
 	id := uuid.New()
 	return &AgentMessage{
 		Header: AgentMessageHeader{
-			HeaderLength:   uint32(TotalHeaderLen),
+			HeaderLength:   uint32(HeaderLengthValue),
 			MessageType:    MsgTypeAcknowledge,
 			SchemaVersion:  SchemaVersion,
 			CreatedDate:    uint64(time.Now().UnixMilli()),
-			SequenceNumber: seq,
-			Flags:          AckFlag,
+			SequenceNumber: 0,
+			Flags:          3, // Agent uses Flags=3 for ACK
 			MessageId:      id,
-			PayloadType:    1,
+			PayloadType:    0, // Agent uses PayloadType=0 for ACK
 			PayloadLength:  uint32(len(payloadBytes)),
 		},
 		Payload: payloadBytes,
@@ -230,13 +243,14 @@ func UnmarshalMessage(data []byte) (*AgentMessage, error) {
 		return nil, err
 	}
 
-	if uint32(len(data)) < h.HeaderLength+h.PayloadLength {
+	// Payload offset = HeaderLength + PayloadLengthLen (per AWS plugin format)
+	payloadOffset := h.HeaderLength + PayloadLengthLen
+	if uint32(len(data)) < payloadOffset+h.PayloadLength {
 		return nil, errors.New("incomplete payload data")
 	}
 
 	payload := make([]byte, h.PayloadLength)
-	// Read payload from proper offset (HeaderLength)
-	copy(payload, data[h.HeaderLength:h.HeaderLength+h.PayloadLength])
+	copy(payload, data[payloadOffset:payloadOffset+h.PayloadLength])
 
 	return &AgentMessage{
 		Header:  h,

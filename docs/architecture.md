@@ -100,32 +100,54 @@ sequenceDiagram
 
 ### 6. Low-Level Protocol Specification
 
-The SSM Agent communication uses a binary message format over WebSocket.
+The SSM Agent communication uses a **binary message format** over WebSocket (not JSON headers).
 
-**Message Structure:**
+**Message Structure (Total Header = 116 bytes fixed):**
 ```
-[HeaderLength (4 bytes, BigEndian)]
-[Header (JSON string of HeaderLength bytes)]
-[PayloadLength (4 bytes, BigEndian)]
-[Payload (Bytes of PayloadLength bytes)]
+Offset  Size  Field
+------  ----  -----
+0       4     HeaderLength (always 116, BigEndian)
+4       32    MessageType (null-padded string: "input_stream_data", "output_stream_data", "acknowledge")
+36      4     SchemaVersion (BigEndian, always 1)
+40      8     CreatedDate (BigEndian, milliseconds since epoch)
+44      8     SequenceNumber (BigEndian, starts at 0)
+52      8     Flags (BigEndian, 0=data, 1=SYN, 2=FIN, 3=ACK)
+60      16    MessageId (UUID bytes, big-endian)
+76      32    PayloadDigest (SHA256 of payload)
+108     4     PayloadType (BigEndian)
+112     4     PayloadLength (BigEndian)
+116     N     Payload (N = PayloadLength bytes)
 ```
 
-**Header Format:**
+**PayloadType Values:**
+| Value | Name | Direction | Description |
+|-------|------|-----------|-------------|
+| 0 | Output | Agent→Plugin | Shell output data |
+| 1 | StdOut | Agent→Plugin | Standard output (Port forwarding) |
+| 5 | HandshakeRequest | Agent→Plugin | Session handshake initiation |
+| 6 | HandshakeResponse | Plugin→Agent | Handshake acknowledgment |
+| 7 | HandshakeComplete | Agent→Plugin | Handshake completion |
+
+**Critical: Sequence Number Handling**
+- First message MUST have `SequenceNumber = 0`
+- Agent validates `SequenceNumber == ExpectedSequenceNumber` (starts at 0)
+- Messages with wrong sequence are silently dropped (ACKed but not processed)
+
+**Acknowledge Payload Format (JSON):**
 ```json
 {
-    "MessageType": "output_stream_data" | "input_stream_data" | "acknowledge",
-    "SchemaVersion": 1,
-    "CreatedDate": 1234567890,
-    "SequenceNumber": 0,
-    "Flags": 0,
-    "MessageId": "uuid"
+    "AcknowledgedMessageType": "output_stream_data",
+    "AcknowledgedMessageId": "uuid-string",
+    "AcknowledgedMessageSequenceNumber": 0,
+    "IsSequentialMessage": true
 }
 ```
 
-**Payload Handling:**
-- **Input (Client -> Agent)**: Raw bytes from the SSH client are wrapped in `input_stream_data`.
-- **Output (Agent -> Client)**: `output_stream_data` payload is unwrapped and written to the SSH client.
-- **Acknowledge**: Must be sent/received to confirm message delivery sequence.
+**Handshake Flow:**
+1. Agent → Plugin: `HandshakeRequest` (PayloadType=5, Seq=0)
+2. Plugin → Agent: ACK + `HandshakeResponse` (PayloadType=6, Seq=0)
+3. Agent → Plugin: `HandshakeComplete` (PayloadType=7, Seq=1)
+4. Session ready for data transfer
 
 ## Security Considerations
 
