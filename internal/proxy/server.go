@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"log"
 	"net"
 
 	"github.com/armon/go-socks5"
@@ -50,6 +51,6 @@ func (s *Server) Start(ctx context.Context) error {
 		ln.Close()
 	}()
 
-	fmt.Printf("SOCKS5 proxy listening on %s\n", addr)
+	log.Printf("[INFO] SOCKS5 proxy listening on %s", addr)
 	return s.socksSrv.Serve(ln)
 }

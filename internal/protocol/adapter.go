@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/url"
 	"sync"
@@ -19,7 +20,7 @@ var DebugMode bool
 
 func debugLog(format string, args ...interface{}) {
 	if DebugMode {
-		fmt.Printf("[DEBUG] "+format+"\n", args...)
+		log.Printf("[DEBUG] "+format, args...)
 	}
 }
 
@@ -104,7 +105,7 @@ func (a *Adapter) readLoop() {
 	for {
 		_, msgBytes, err := a.conn.ReadMessage()
 		if err != nil {
-			debugLog("WS Read Error: %v", err)
+		debugLog("WS Read Error: %v", err)
 			a.writer.CloseWithError(err)
 			return
 		}
@@ -112,7 +113,7 @@ func (a *Adapter) readLoop() {
 		// Deserialize AgentMessage
 		agentMsg, err := UnmarshalMessage(msgBytes)
 		if err != nil {
-			debugLog("Unmarshal Error: %v", err)
+		debugLog("Unmarshal Error: %v", err)
 			continue
 		}
 
@@ -168,7 +169,7 @@ func (a *Adapter) readLoop() {
 				// Check for SSM Handshake JSON (fallback for older agent versions)
 				if bytes.Contains(agentMsg.Payload, []byte("AgentVersion")) ||
 					bytes.Contains(agentMsg.Payload, []byte("RequestedClientActions")) {
-					debugLog("Ignored Agent Handshake Message (legacy): %s", string(agentMsg.Payload))
+				debugLog("Ignored Agent Handshake Message (legacy): %s", string(agentMsg.Payload))
 				} else {
 					// Normal data - forward to reader
 					if _, err := a.writer.Write(agentMsg.Payload); err != nil {
@@ -185,15 +186,15 @@ func (a *Adapter) readLoop() {
 
 		case MsgTypeAcknowledge:
 			// Received ACK for our sent message - could update retransmission state
-			debugLog("Received ACK: %s", string(agentMsg.Payload))
+		debugLog("Received ACK: %s", string(agentMsg.Payload))
 
 		case MsgTypeChannelClosed:
-			debugLog("Channel closed by remote")
+		debugLog("Channel closed by remote")
 			a.writer.CloseWithError(io.EOF)
 			return
 
 		default:
-			debugLog("Ignored Message Type: %s", agentMsg.Header.MessageType)
+		debugLog("Ignored Message Type: %s", agentMsg.Header.MessageType)
 		}
 	}
 }

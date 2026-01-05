@@ -27,7 +27,7 @@ func main() {
 
 	if *debug {
 		protocol.DebugMode = true
-		log.Println("Debug mode enabled")
+		log.Println("[INFO] Debug mode enabled")
 	}
 
 	if *target == "" {
@@ -44,12 +44,12 @@ func main() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("Received signal, shutting down...")
+		log.Println("[INFO] Received signal, shutting down...")
 		cancel()
 	}()
 
 	// 1. Start SSM Session
-	log.Printf("Starting SSM session to %s...", *target)
+	log.Printf("[INFO] Starting SSM session to %s...", *target)
 	ssmClient, err := ssm.NewClient(ctx, *region)
 	if err != nil {
 		log.Fatalf("Failed to create SSM client: %v", err)
@@ -59,10 +59,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to start session: %v", err)
 	}
-	log.Printf("Session started (ID: %s)", session.SessionId)
+	log.Printf("[INFO] Session started (ID: %s)", session.SessionId)
 
 	// 2. Connect via WebSocket Adapter
-	log.Println("Connecting via WebSocket...")
+	log.Println("[INFO] Connecting via WebSocket...")
 	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
 	if err != nil {
 		log.Fatalf("Failed to connect to stream URL: %v", err)
@@ -76,14 +76,14 @@ func main() {
 	defer adapter.Close()
 
 	// 2.5 Wait for SSM handshake to complete
-	log.Println("Waiting for SSM handshake...")
+	log.Println("[INFO] Waiting for SSM handshake...")
 	if err := adapter.WaitForHandshake(ctx); err != nil {
 		log.Fatalf("SSM handshake failed: %v", err)
 	}
-	log.Println("SSM handshake completed")
+	log.Println("[INFO] SSM handshake completed")
 
 	// 3. Establish SSH Connection
-	log.Printf("Establishing SSH connection as user '%s'...", *sshUser)
+	log.Printf("[INFO] Establishing SSH connection as user '%s'...", *sshUser)
 	sshClient, err := ssh.Connect(adapter, ssh.Config{
 		User:           *sshUser,
 		PrivateKeyPath: *sshKey,
@@ -92,7 +92,7 @@ func main() {
 		log.Fatalf("SSH connection failed: %v", err)
 	}
 	defer sshClient.Close()
-	log.Println("SSH handshake successful")
+	log.Println("[INFO] SSH handshake successful")
 
 	// 4. Start SOCKS5 Server
 	socksServer, err := proxy.NewServer(*socksPort, sshClient)
@@ -100,7 +100,7 @@ func main() {
 		log.Fatalf("Failed to create SOCKS5 server: %v", err)
 	}
 
-	log.Printf("Starting SOCKS5 proxy on port %d...", *socksPort)
+	log.Printf("[INFO] Starting SOCKS5 proxy on port %d...", *socksPort)
 	if err := socksServer.Start(ctx); err != nil {
 		// Start returns error when server stops usually
 		if ctx.Err() == nil {
@@ -108,5 +108,5 @@ func main() {
 		}
 	}
 
-	log.Println("Shutdown complete")
+	log.Println("[INFO] Shutdown complete")
 }
