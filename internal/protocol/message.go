@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -46,18 +47,18 @@ const (
 	FlagFin  = 2 // Stream end (bit 1)
 
 	// PayloadType values
-	PayloadTypeOutput                  uint32 = 1
-	PayloadTypeError                   uint32 = 2
-	PayloadTypeSize                    uint32 = 3
-	PayloadTypeParameter               uint32 = 4
-	PayloadTypeHandshakeRequest        uint32 = 5
-	PayloadTypeHandshakeResponse       uint32 = 6
-	PayloadTypeHandshakeComplete       uint32 = 7
-	PayloadTypeEncChallengeRequest     uint32 = 8
-	PayloadTypeEncChallengeResponse    uint32 = 9
-	PayloadTypeFlag                    uint32 = 10
-	PayloadTypeStdErr                  uint32 = 11
-	PayloadTypeExitCode                uint32 = 12
+	PayloadTypeOutput               uint32 = 1
+	PayloadTypeError                uint32 = 2
+	PayloadTypeSize                 uint32 = 3
+	PayloadTypeParameter            uint32 = 4
+	PayloadTypeHandshakeRequest     uint32 = 5
+	PayloadTypeHandshakeResponse    uint32 = 6
+	PayloadTypeHandshakeComplete    uint32 = 7
+	PayloadTypeEncChallengeRequest  uint32 = 8
+	PayloadTypeEncChallengeResponse uint32 = 9
+	PayloadTypeFlag                 uint32 = 10
+	PayloadTypeStdErr               uint32 = 11
+	PayloadTypeExitCode             uint32 = 12
 )
 
 type AgentMessage struct {
@@ -96,12 +97,48 @@ func NewInputMessage(payload []byte, seq int64) (*AgentMessage, error) {
 	}, nil
 }
 
+// AcknowledgeContent is used to inform the sender of an acknowledge message that the message has been received.
+type AcknowledgeContent struct {
+	MessageType         string `json:"AcknowledgedMessageType"`
+	MessageId           string `json:"AcknowledgedMessageId"`
+	SequenceNumber      int64  `json:"AcknowledgedMessageSequenceNumber"`
+	IsSequentialMessage bool   `json:"IsSequentialMessage"`
+}
+
+// HandshakeResponsePayload sent by the plugin/proxy in response to the handshake request
+type HandshakeResponsePayload struct {
+	ClientVersion          string                  `json:"ClientVersion"`
+	ProcessedClientActions []ProcessedClientAction `json:"ProcessedClientActions"`
+	Errors                 []string                `json:"Errors"`
+}
+
+// ProcessedClientAction part of HandshakeResponse
+type ProcessedClientAction struct {
+	ActionType   string          `json:"ActionType"`
+	ActionStatus int             `json:"ActionStatus"`
+	ActionResult json.RawMessage `json:"ActionResult"`
+	Error        string          `json:"Error"`
+}
+
+// CleanUUID returns the UUID string without hyphens, as required by SSM Agent
+func CleanUUID(u uuid.UUID) string {
+	return strings.ReplaceAll(u.String(), "-", "")
+}
+
 func NewAcknowledgeMessage(refMsgType string, refMsgId uuid.UUID, refSeq int64) (*AgentMessage, error) {
 	// ACK payload is pure JSON (no internal length prefix)
-	// Agent uses Flags=3 and PayloadType=0 for ACK messages
-	ackJson := fmt.Sprintf(`{"AcknowledgedMessageType":"%s","AcknowledgedMessageId":"%s","AcknowledgedMessageSequenceNumber":%d,"IsSequentialMessage":true}`,
-		refMsgType, refMsgId.String(), refSeq)
-	payloadBytes := []byte(ackJson)
+	// AWS Plugin uses MessageId.String() (with hyphens) - see session-manager-plugin/src/datachannel/streaming.go:386
+	ackPayload := AcknowledgeContent{
+		MessageType:         refMsgType,
+		MessageId:           refMsgId.String(), // Use standard UUID with hyphens (per AWS Plugin)
+		SequenceNumber:      refSeq,
+		IsSequentialMessage: true,
+	}
+
+	payloadBytes, err := json.Marshal(ackPayload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal acknowledge payload: %v", err)
+	}
 
 	id := uuid.New()
 	return &AgentMessage{
@@ -120,6 +157,35 @@ func NewAcknowledgeMessage(refMsgType string, refMsgId uuid.UUID, refSeq int64) 
 	}, nil
 }
 
+func NewHandshakeResponseMessage(seq int64, clientVersion string, actions []ProcessedClientAction) (*AgentMessage, error) {
+	response := HandshakeResponsePayload{
+		ClientVersion:          clientVersion,
+		ProcessedClientActions: actions,
+		Errors:                 []string{},
+	}
+
+	payloadBytes, err := json.Marshal(response)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal handshake response: %v", err)
+	}
+
+	id := uuid.New()
+	return &AgentMessage{
+		Header: AgentMessageHeader{
+			HeaderLength:   uint32(HeaderLengthValue),
+			MessageType:    MsgTypeInputStreamData,
+			SchemaVersion:  SchemaVersion,
+			CreatedDate:    uint64(time.Now().UnixMilli()),
+			SequenceNumber: seq,
+			Flags:          FlagData,
+			MessageId:      id,
+			PayloadType:    PayloadTypeHandshakeResponse,
+			PayloadLength:  uint32(len(payloadBytes)),
+		},
+		Payload: payloadBytes,
+	}, nil
+}
+
 func (m *AgentMessage) MarshalBinary() ([]byte, error) {
 	buf := new(bytes.Buffer)
 
@@ -128,8 +194,12 @@ func (m *AgentMessage) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 
-	// 2. MessageType (32 bytes string)
+	// 2. MessageType (32 bytes string, space-padded per AWS protocol)
+	// AWS uses spaces (0x20) for padding, NOT null bytes (0x00)
 	var typeBytes [32]byte
+	for i := range typeBytes {
+		typeBytes[i] = ' ' // Fill with spaces first
+	}
 	copy(typeBytes[:], m.Header.MessageType)
 	if err := binary.Write(buf, binary.BigEndian, typeBytes); err != nil {
 		return nil, err
@@ -155,8 +225,16 @@ func (m *AgentMessage) MarshalBinary() ([]byte, error) {
 		return nil, err
 	}
 
-	// 7. MessageId (16 bytes)
-	if err := binary.Write(buf, binary.BigEndian, m.Header.MessageId); err != nil {
+	// 7. MessageId (16 bytes) - AWS uses swapped byte order!
+	// AWS writes: bytes[8:16] first (LSB), then bytes[0:8] (MSB)
+	// See session-manager-plugin/src/message/messageparser.go:putUuid
+	uuidBytes := m.Header.MessageId[:]
+	// Write LSB (bytes 8-16) first
+	if err := binary.Write(buf, binary.BigEndian, uuidBytes[8:16]); err != nil {
+		return nil, err
+	}
+	// Write MSB (bytes 0-8) second
+	if err := binary.Write(buf, binary.BigEndian, uuidBytes[0:8]); err != nil {
 		return nil, err
 	}
 
@@ -223,10 +301,18 @@ func UnmarshalMessage(data []byte) (*AgentMessage, error) {
 		return nil, err
 	}
 
-	// 7. MessageId
-	if err := binary.Read(r, binary.BigEndian, &h.MessageId); err != nil {
+	// 7. MessageId - AWS uses swapped byte order (LSB first, then MSB)
+	// Read in AWS order, then reconstruct UUID
+	var lsb, msb [8]byte
+	if err := binary.Read(r, binary.BigEndian, &lsb); err != nil {
 		return nil, err
 	}
+	if err := binary.Read(r, binary.BigEndian, &msb); err != nil {
+		return nil, err
+	}
+	// Reconstruct: MSB (bytes 0-8) then LSB (bytes 8-16)
+	copy(h.MessageId[0:8], msb[:])
+	copy(h.MessageId[8:16], lsb[:])
 
 	// 8. PayloadDigest
 	if err := binary.Read(r, binary.BigEndian, &h.PayloadDigest); err != nil {

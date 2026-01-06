@@ -52,3 +52,21 @@ The session-proxy is now fully functional. SSM handshake, SSH tunnel, and SOCKS5
 
 ## Known Behaviors
 - SSM Agent continues retransmitting HandshakeRequest even after handshake completes (normal behavior, handled by deduplication)
+
+## Jan 6 Fixes (Based on DUPLICATE_HANDSHAKE_FIX.md and MESSAGE_REORDER_ISSUE.md)
+
+12. **Fixed Persistent HandshakeRequest Retransmission**:
+    - **Problem**: Agent kept resending HandshakeRequest despite ACKs.
+    - **Root Causes Identified**:
+      1. **MessageType Padding**: Proxy used null-bytes (0x00) for 32-byte padding, AWS uses spaces (0x20).
+      2. **UUID Byte Order**: AWS Agent uses a custom byte order (LSB first for bytes 8-16, then MSB for bytes 0-8) for `MessageId` serialization. Proxy used standard BigEndian.
+    - **Fix**: Adjusted `MarshalBinary` and `UnmarshalMessage` to match AWS specific binary format exactly.
+    - **Result**: Handshake completes cleanly without infinite retransmissions.
+    - **Documentation**: [DUPLICATE_HANDSHAKE_FIX.md](DUPLICATE_HANDSHAKE_FIX.md)
+
+13. **Fixed SSH "Max Packet Length Exceeded" Error**:
+    - **Problem**: SSH connection would drop with "max packet length exceeded" after some data transfer.
+    - **Cause**: Out-of-order message delivery (e.g., Seq 25 arriving after Seq 36). The proxy was forwarding raw payloads directly to the SSH client without reordering, corrupting the SSH stream.
+    - **Fix**: Implemented `incomingMsgBuffer` and `expectedSeqNum` logic in `Adapter`. Messages are now buffered and processed strictly in sequence order.
+    - **Result**: Stable SSH connection and data transfer.
+    - **Documentation**: [MESSAGE_REORDER_ISSUE.md](MESSAGE_REORDER_ISSUE.md)
