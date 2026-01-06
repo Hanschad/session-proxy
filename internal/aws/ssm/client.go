@@ -25,10 +25,9 @@ func NewClient(ctx context.Context, region string) (*Client, error) {
 }
 
 type Session struct {
-	StreamArgs  string
-	TokenValue  string
-	StreamUrl   string
-	SessionId   string
+	TokenValue string
+	StreamUrl  string
+	SessionId  string
 }
 
 func (c *Client) StartSession(ctx context.Context, instanceID string) (*Session, error) {

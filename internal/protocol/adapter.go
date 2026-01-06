@@ -1,7 +1,6 @@
 package protocol
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -109,113 +108,139 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 }
 
 func (a *Adapter) readLoop() {
-	defer a.Close() // Ensure we close everything on exit
+	defer a.Close()
 
 	for {
-		_, msgBytes, err := a.conn.ReadMessage()
+		msg, err := a.readMessage()
 		if err != nil {
-			debugLog("WS Read Error: %v", err)
 			a.writer.CloseWithError(err)
 			return
 		}
-
-		// Deserialize AgentMessage
-		agentMsg, err := UnmarshalMessage(msgBytes)
-		if err != nil {
-			debugLog("Unmarshal Error: %v", err)
-			continue
+		if msg == nil {
+			continue // unmarshal error, already logged
 		}
-
-		debugLog("RX Frame: Type=%s Seq=%d Len=%d Flags=%d PayloadType=%d HL=%d MsgId=%s",
-			agentMsg.Header.MessageType,
-			agentMsg.Header.SequenceNumber,
-			len(agentMsg.Payload),
-			agentMsg.Header.Flags,
-			agentMsg.Header.PayloadType,
-			agentMsg.Header.HeaderLength,
-			agentMsg.Header.MessageId.String())
-		if agentMsg.Header.MessageType == MsgTypeOutputStreamData || agentMsg.Header.MessageType == MsgTypeAcknowledge {
-			debugLog("Payload: %q", string(agentMsg.Payload))
-		}
-
-		// Check for duplicate messages
-		a.seenMsgIdsMu.Lock()
-		isDuplicate := a.seenMsgIds[agentMsg.Header.MessageId]
-		if !isDuplicate {
-			a.seenMsgIds[agentMsg.Header.MessageId] = true
-		}
-		a.seenMsgIdsMu.Unlock()
-
-		switch agentMsg.Header.MessageType {
-		case MsgTypeOutputStreamData:
-			// Handle based on PayloadType
-			switch agentMsg.Header.PayloadType {
-			case PayloadTypeHandshakeRequest:
-				// SSM Agent handshake - respond and ACK
-				debugLog("Received HandshakeRequest: %s", string(agentMsg.Payload))
-				// Per official plugin: always ACK + Response (even for retransmissions)
-				if isDuplicate || a.handshakeResponded {
-					debugLog("Received duplicate HandshakeRequest, resending ACK + Response")
-					if err := a.sendAck(agentMsg); err != nil {
-						debugLog("Ack Send Error: %v", err)
-					}
-					// Also resend HandshakeResponse (in case first one was lost)
-					if err := a.resendHandshakeResponse(); err != nil {
-						debugLog("HandshakeResponse resend error: %v", err)
-					}
-				} else if err := a.handleHandshakeRequest(agentMsg); err != nil {
-					debugLog("HandshakeRequest handling error: %v", err)
-				} else {
-					// Successfully processed HandshakeRequest - update expected sequence
-					a.incomingMsgBufMu.Lock()
-					a.expectedSeqNum = agentMsg.Header.SequenceNumber + 1
-					a.incomingMsgBufMu.Unlock()
-					debugLog("Updated expectedSeqNum to %d after HandshakeRequest", a.expectedSeqNum)
-				}
-
-			case PayloadTypeHandshakeComplete:
-				// Handshake complete - session ready
-				debugLog("Received HandshakeComplete: %s", string(agentMsg.Payload))
-				if !a.handshakeComplete {
-					a.handshakeComplete = true
-					close(a.handshakeDone) // Signal that handshake is complete
-					// Update expected sequence number
-					a.incomingMsgBufMu.Lock()
-					a.expectedSeqNum = agentMsg.Header.SequenceNumber + 1
-					a.incomingMsgBufMu.Unlock()
-					debugLog("Updated expectedSeqNum to %d after HandshakeComplete", a.expectedSeqNum)
-				}
-				if err := a.sendAck(agentMsg); err != nil {
-					debugLog("Ack Send Error: %v", err)
-				}
-
-			default:
-				// Check for SSM Handshake JSON (fallback for older agent versions)
-				if bytes.Contains(agentMsg.Payload, []byte("AgentVersion")) ||
-					bytes.Contains(agentMsg.Payload, []byte("RequestedClientActions")) {
-					debugLog("Ignored Agent Handshake Message (legacy): %s", string(agentMsg.Payload))
-					if err := a.sendAck(agentMsg); err != nil {
-						debugLog("Ack Send Error: %v", err)
-					}
-				} else {
-					// Normal data - process with sequence ordering
-					a.handleDataMessage(agentMsg)
-				}
-			}
-
-		case MsgTypeAcknowledge:
-			// Received ACK for our sent message - could update retransmission state
-			debugLog("Received ACK: %s", string(agentMsg.Payload))
-
-		case MsgTypeChannelClosed:
-			debugLog("Channel closed by remote")
-			a.writer.CloseWithError(io.EOF)
-			return
-
-		default:
-			debugLog("Ignored Message Type: %s", agentMsg.Header.MessageType)
+		if !a.dispatchMessage(msg) {
+			return // channel closed
 		}
 	}
+}
+
+// readMessage reads and parses a single message from WebSocket
+func (a *Adapter) readMessage() (*AgentMessage, error) {
+	_, msgBytes, err := a.conn.ReadMessage()
+	if err != nil {
+		debugLog("WS Read Error: %v", err)
+		return nil, err
+	}
+
+	agentMsg, err := UnmarshalMessage(msgBytes)
+	if err != nil {
+		debugLog("Unmarshal Error: %v", err)
+		return nil, nil // non-fatal, return nil message
+	}
+
+	debugLog("RX Frame: Type=%s Seq=%d Len=%d Flags=%d PayloadType=%d HL=%d MsgId=%s",
+		agentMsg.Header.MessageType,
+		agentMsg.Header.SequenceNumber,
+		len(agentMsg.Payload),
+		agentMsg.Header.Flags,
+		agentMsg.Header.PayloadType,
+		agentMsg.Header.HeaderLength,
+		agentMsg.Header.MessageId.String())
+	if agentMsg.Header.MessageType == MsgTypeOutputStreamData || agentMsg.Header.MessageType == MsgTypeAcknowledge {
+		debugLog("Payload: %q", string(agentMsg.Payload))
+	}
+
+	return agentMsg, nil
+}
+
+// dispatchMessage routes message to appropriate handler. Returns false if channel closed.
+func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
+	isDuplicate := a.markMessageSeen(msg.Header.MessageId)
+
+	switch msg.Header.MessageType {
+	case MsgTypeOutputStreamData:
+		a.handleOutputStream(msg, isDuplicate)
+	case MsgTypeAcknowledge:
+		debugLog("Received ACK: %s", string(msg.Payload))
+	case MsgTypeChannelClosed:
+		debugLog("Channel closed by remote")
+		a.writer.CloseWithError(io.EOF)
+		return false
+	default:
+		debugLog("Ignored Message Type: %s", msg.Header.MessageType)
+	}
+	return true
+}
+
+// markMessageSeen checks and marks a message ID as seen. Returns true if duplicate.
+func (a *Adapter) markMessageSeen(id uuid.UUID) bool {
+	a.seenMsgIdsMu.Lock()
+	defer a.seenMsgIdsMu.Unlock()
+
+	isDuplicate := a.seenMsgIds[id]
+	if !isDuplicate {
+		a.seenMsgIds[id] = true
+	}
+	return isDuplicate
+}
+
+// handleOutputStream processes output_stream_data messages based on PayloadType
+func (a *Adapter) handleOutputStream(msg *AgentMessage, isDuplicate bool) {
+	switch msg.Header.PayloadType {
+	case PayloadTypeHandshakeRequest:
+		a.handleHandshakeRequestPayload(msg, isDuplicate)
+	case PayloadTypeHandshakeComplete:
+		a.handleHandshakeCompletePayload(msg)
+	default:
+		a.handleDataMessage(msg)
+	}
+}
+
+// handleHandshakeRequestPayload handles HandshakeRequest payload type
+func (a *Adapter) handleHandshakeRequestPayload(msg *AgentMessage, isDuplicate bool) {
+	debugLog("Received HandshakeRequest: %s", string(msg.Payload))
+
+	if isDuplicate || a.handshakeResponded {
+		debugLog("Received duplicate HandshakeRequest, resending ACK + Response")
+		if err := a.sendAck(msg); err != nil {
+			debugLog("Ack Send Error: %v", err)
+		}
+		if err := a.resendHandshakeResponse(); err != nil {
+			debugLog("HandshakeResponse resend error: %v", err)
+		}
+		return
+	}
+
+	if err := a.handleHandshakeRequest(msg); err != nil {
+		debugLog("HandshakeRequest handling error: %v", err)
+		return
+	}
+
+	a.updateExpectedSeqNum(msg, "HandshakeRequest")
+}
+
+// handleHandshakeCompletePayload handles HandshakeComplete payload type
+func (a *Adapter) handleHandshakeCompletePayload(msg *AgentMessage) {
+	debugLog("Received HandshakeComplete: %s", string(msg.Payload))
+
+	if !a.handshakeComplete {
+		a.handshakeComplete = true
+		close(a.handshakeDone)
+		a.updateExpectedSeqNum(msg, "HandshakeComplete")
+	}
+
+	if err := a.sendAck(msg); err != nil {
+		debugLog("Ack Send Error: %v", err)
+	}
+}
+
+// updateExpectedSeqNum updates the expected sequence number after processing a message
+func (a *Adapter) updateExpectedSeqNum(msg *AgentMessage, context string) {
+	a.incomingMsgBufMu.Lock()
+	a.expectedSeqNum = msg.Header.SequenceNumber + 1
+	a.incomingMsgBufMu.Unlock()
+	debugLog("Updated expectedSeqNum to %d after %s", a.expectedSeqNum, context)
 }
 
 func (a *Adapter) handleHandshakeRequest(orig *AgentMessage) error {
