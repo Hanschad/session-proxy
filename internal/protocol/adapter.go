@@ -58,7 +58,7 @@ const ClientVersion = "1.2.0.0"
 
 // PingInterval is the interval for sending WebSocket ping frames to keep the connection alive.
 // Matches AWS session-manager-plugin behavior (5 minutes).
-const PingInterval = 5 * time.Minute
+const PingInterval = 1 * time.Minute
 
 func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) {
 	dialer := websocket.Dialer{

@@ -54,3 +54,27 @@ func (c *Client) StartSession(ctx context.Context, instanceID string) (*Session,
 		SessionId:  *out.SessionId,
 	}, nil
 }
+
+// ResumeSession resumes an existing session to get a new token.
+// This is used for reconnection after a network interruption.
+// The session must still be valid on the server side.
+func (c *Client) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
+	input := &mv2.ResumeSessionInput{
+		SessionId: aws.String(sessionID),
+	}
+
+	out, err := c.svc.ResumeSession(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resume session: %w", err)
+	}
+
+	if out.StreamUrl == nil || out.TokenValue == nil {
+		return nil, fmt.Errorf("ssm resume session response missing stream url or token")
+	}
+
+	return &Session{
+		StreamUrl:  *out.StreamUrl,
+		TokenValue: *out.TokenValue,
+		SessionId:  sessionID,
+	}, nil
+}

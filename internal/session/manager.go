@@ -3,11 +3,11 @@ package session
 import (
 	"context"
 	"log"
-	"time"
 
 	"github.com/hanschad/session-proxy/internal/aws/ssm"
 	"github.com/hanschad/session-proxy/internal/protocol"
 	"github.com/hanschad/session-proxy/internal/proxy"
+	"github.com/hanschad/session-proxy/internal/retry"
 	internalssh "github.com/hanschad/session-proxy/internal/ssh"
 	gossh "golang.org/x/crypto/ssh"
 )
@@ -25,8 +25,11 @@ type Manager struct {
 	sshClient   *gossh.Client
 	socksServer *proxy.Server
 
-	reconnectInterval time.Duration
-	maxRetries        int
+	// Session state for resume
+	lastSessionID string
+
+	// Retry configuration
+	retryer *retry.ExponentialRetryer
 }
 
 // Config holds session manager configuration
@@ -41,20 +44,17 @@ type Config struct {
 // NewManager creates a new session manager
 func NewManager(cfg Config) *Manager {
 	return &Manager{
-		instanceID:        cfg.InstanceID,
-		region:            cfg.Region,
-		sshUser:           cfg.SSHUser,
-		sshKeyPath:        cfg.SSHKeyPath,
-		socksPort:         cfg.SocksPort,
-		reconnectInterval: 5 * time.Second,
-		maxRetries:        10,
+		instanceID: cfg.InstanceID,
+		region:     cfg.Region,
+		sshUser:    cfg.SSHUser,
+		sshKeyPath: cfg.SSHKeyPath,
+		socksPort:  cfg.SocksPort,
+		retryer:    retry.DefaultRetryer(),
 	}
 }
 
-// Run starts the session with automatic reconnection
+// Run starts the session with automatic reconnection using exponential backoff.
 func (m *Manager) Run(ctx context.Context) error {
-	retries := 0
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -62,25 +62,20 @@ func (m *Manager) Run(ctx context.Context) error {
 		default:
 		}
 
-		if err := m.connect(ctx); err != nil {
-			retries++
-			if retries > m.maxRetries {
-				log.Printf("[ERROR] Max retries (%d) exceeded, giving up", m.maxRetries)
-				return err
-			}
-			log.Printf("[WARN] Connection failed (attempt %d/%d): %v, retrying in %v",
-				retries, m.maxRetries, err, m.reconnectInterval)
-
+		// Use exponential backoff retryer for connection attempts
+		err := m.retryer.Run(func() error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(m.reconnectInterval):
-				continue
+			default:
 			}
-		}
+			return m.connect(ctx)
+		})
 
-		// Reset retry counter on successful connection
-		retries = 0
+		if err != nil {
+			log.Printf("[ERROR] Connection failed after retries: %v", err)
+			return err
+		}
 
 		// Wait for connection to close
 		<-m.adapter.Done()
@@ -89,7 +84,11 @@ func (m *Manager) Run(ctx context.Context) error {
 	}
 }
 
-// connect establishes SSM -> SSH -> SOCKS5 pipeline
+// connect establishes SSM -> SSH -> SOCKS5 pipeline.
+// NOTE: ResumeSession is NOT used for SSH tunnels because:
+//   - ResumeSession only resumes the SSM/WebSocket layer
+//   - The SSH session inside the tunnel is lost when WebSocket closes
+//   - SSH requires a fresh handshake which the resumed session cannot provide
 func (m *Manager) connect(ctx context.Context) error {
 	var err error
 
@@ -101,7 +100,7 @@ func (m *Manager) connect(ctx context.Context) error {
 		}
 	}
 
-	// 2. Start SSM session
+	// 2. Always start a new session for SSH tunnels
 	log.Printf("[INFO] Starting SSM session to %s...", m.instanceID)
 	session, err := m.ssmClient.StartSession(ctx, m.instanceID)
 	if err != nil {
@@ -124,7 +123,7 @@ func (m *Manager) connect(ctx context.Context) error {
 	}
 	log.Println("[INFO] SSM handshake completed")
 
-	// 5. Establish SSH connection
+	// 6. Establish SSH connection
 	log.Printf("[INFO] Establishing SSH connection as user '%s'...", m.sshUser)
 	m.sshClient, err = internalssh.Connect(m.adapter, internalssh.Config{
 		User:           m.sshUser,
@@ -136,7 +135,7 @@ func (m *Manager) connect(ctx context.Context) error {
 	}
 	log.Println("[INFO] SSH handshake successful")
 
-	// 6. Start SOCKS5 server or update dialer on reconnection
+	// 7. Start SOCKS5 server or update dialer on reconnection
 	if m.socksServer == nil {
 		// First connection: create SOCKS5 server
 		m.socksServer, err = proxy.NewServer(m.socksPort, m.sshClient)
