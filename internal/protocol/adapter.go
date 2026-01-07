@@ -56,6 +56,10 @@ type Adapter struct {
 // ClientVersion is the version reported to the SSM service
 const ClientVersion = "1.2.0.0"
 
+// PingInterval is the interval for sending WebSocket ping frames to keep the connection alive.
+// Matches AWS session-manager-plugin behavior (5 minutes).
+const PingInterval = 5 * time.Minute
+
 func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -102,7 +106,14 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		expectedSeqNum:    0,
 	}
 
+	// Set PongHandler to verify server is responding to our pings
+	wsConn.SetPongHandler(func(appData string) error {
+		debugLog("WebSocket Pong received")
+		return nil
+	})
+
 	go adapter.readLoop()
+	go adapter.startPings()
 
 	return adapter, nil
 }
@@ -129,7 +140,7 @@ func (a *Adapter) readLoop() {
 func (a *Adapter) readMessage() (*AgentMessage, error) {
 	_, msgBytes, err := a.conn.ReadMessage()
 	if err != nil {
-		debugLog("WS Read Error: %v", err)
+		log.Printf("[WARN] WS Read Error: %v", err)
 		return nil, err
 	}
 
@@ -174,12 +185,22 @@ func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
 }
 
 // markMessageSeen checks and marks a message ID as seen. Returns true if duplicate.
+// Prunes oldest entries when map exceeds maxSeenMsgIds to prevent memory leak.
+const maxSeenMsgIds = 1000
+
 func (a *Adapter) markMessageSeen(id uuid.UUID) bool {
 	a.seenMsgIdsMu.Lock()
 	defer a.seenMsgIdsMu.Unlock()
 
 	isDuplicate := a.seenMsgIds[id]
 	if !isDuplicate {
+		// Prune if map is too large (delete one random entry)
+		if len(a.seenMsgIds) >= maxSeenMsgIds {
+			for k := range a.seenMsgIds {
+				delete(a.seenMsgIds, k)
+				break
+			}
+		}
 		a.seenMsgIds[id] = true
 	}
 	return isDuplicate
@@ -408,6 +429,34 @@ func (a *Adapter) Close() error {
 		a.conn.Close()
 	})
 	return nil
+}
+
+// startPings sends periodic WebSocket ping frames to keep the connection alive.
+// This is required because AWS SSM service will close idle connections.
+// Matches the behavior of AWS session-manager-plugin (websocketchannel.go:85-104).
+func (a *Adapter) startPings() {
+	debugLog("Ping loop started, interval=%v", PingInterval)
+	ticker := time.NewTicker(PingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-a.done:
+			debugLog("Stopping ping loop - adapter closed")
+			return
+		case <-ticker.C:
+			a.writeMu.Lock()
+			err := a.conn.WriteMessage(websocket.PingMessage, []byte("keepalive"))
+			a.writeMu.Unlock()
+
+			if err != nil {
+				debugLog("WebSocket Ping failed: %v, closing adapter to trigger reconnect", err)
+				a.Close()
+				return
+			}
+			debugLog("WebSocket Ping sent")
+		}
+	}
 }
 
 // Done returns a channel that is closed when the adapter is closed.

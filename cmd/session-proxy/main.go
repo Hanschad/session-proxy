@@ -9,10 +9,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hanschad/session-proxy/internal/aws/ssm"
 	"github.com/hanschad/session-proxy/internal/protocol"
-	"github.com/hanschad/session-proxy/internal/proxy"
-	"github.com/hanschad/session-proxy/internal/ssh"
+	"github.com/hanschad/session-proxy/internal/session"
 )
 
 func main() {
@@ -48,63 +46,19 @@ func main() {
 		cancel()
 	}()
 
-	// 1. Start SSM Session
-	log.Printf("[INFO] Starting SSM session to %s...", *target)
-	ssmClient, err := ssm.NewClient(ctx, *region)
-	if err != nil {
-		log.Fatalf("Failed to create SSM client: %v", err)
-	}
-
-	session, err := ssmClient.StartSession(ctx, *target)
-	if err != nil {
-		log.Fatalf("Failed to start session: %v", err)
-	}
-	log.Printf("[INFO] Session started (ID: %s)", session.SessionId)
-
-	// 2. Connect via WebSocket Adapter
-	log.Println("[INFO] Connecting via WebSocket...")
-	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
-	if err != nil {
-		log.Fatalf("Failed to connect to stream URL: %v", err)
-	}
-	// Important: Handle cancellation by closing the adapter to unblock Read() calls
-	go func() {
-		<-ctx.Done()
-		adapter.Close()
-	}()
-	// We still defer Close in case of normal exit, though Close is idempotent-ish
-	defer adapter.Close()
-
-	// 2.5 Wait for SSM handshake to complete
-	log.Println("[INFO] Waiting for SSM handshake...")
-	if err := adapter.WaitForHandshake(ctx); err != nil {
-		log.Fatalf("SSM handshake failed: %v", err)
-	}
-	log.Println("[INFO] SSM handshake completed")
-
-	// 3. Establish SSH Connection
-	log.Printf("[INFO] Establishing SSH connection as user '%s'...", *sshUser)
-	sshClient, err := ssh.Connect(adapter, ssh.Config{
-		User:           *sshUser,
-		PrivateKeyPath: *sshKey,
+	// Create session manager with automatic reconnection
+	mgr := session.NewManager(session.Config{
+		InstanceID: *target,
+		Region:     *region,
+		SSHUser:    *sshUser,
+		SSHKeyPath: *sshKey,
+		SocksPort:  *socksPort,
 	})
-	if err != nil {
-		log.Fatalf("SSH connection failed: %v", err)
-	}
-	defer sshClient.Close()
-	log.Println("[INFO] SSH handshake successful")
 
-	// 4. Start SOCKS5 Server
-	socksServer, err := proxy.NewServer(*socksPort, sshClient)
-	if err != nil {
-		log.Fatalf("Failed to create SOCKS5 server: %v", err)
-	}
-
-	log.Printf("[INFO] Starting SOCKS5 proxy on port %d...", *socksPort)
-	if err := socksServer.Start(ctx); err != nil {
-		// Start returns error when server stops usually
+	// Run session with automatic reconnection
+	if err := mgr.Run(ctx); err != nil {
 		if ctx.Err() == nil {
-			log.Fatalf("SOCKS5 server failed: %v", err)
+			log.Fatalf("Session failed: %v", err)
 		}
 	}
 
