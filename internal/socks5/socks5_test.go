@@ -190,3 +190,131 @@ func TestConnect(t *testing.T) {
 		t.Errorf("expected %s, got %s", testData, echoed)
 	}
 }
+
+func TestHandshakeWithAuth(t *testing.T) {
+	srv := New(&Config{
+		Auth: &AuthConfig{
+			User: "admin",
+			Pass: "secret123",
+		},
+	})
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan error)
+	go func() {
+		done <- srv.handshake(server)
+	}()
+
+	// Client sends: VER(5) + NMETHODS(1) + METHODS(UserPass)
+	client.Write([]byte{Version, 0x01, MethodUserPass})
+
+	// Read server response (should request UserPass)
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(client, resp); err != nil {
+		t.Fatalf("read method response: %v", err)
+	}
+	if resp[0] != Version || resp[1] != MethodUserPass {
+		t.Errorf("expected [5, 2], got %v", resp)
+	}
+
+	// Send auth: VER(1) + ULEN(5) + "admin" + PLEN(9) + "secret123"
+	authReq := []byte{0x01, 5}
+	authReq = append(authReq, "admin"...)
+	authReq = append(authReq, 9)
+	authReq = append(authReq, "secret123"...)
+	client.Write(authReq)
+
+	// Read auth response
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(client, authResp); err != nil {
+		t.Fatalf("read auth response: %v", err)
+	}
+	if authResp[0] != 0x01 || authResp[1] != 0x00 {
+		t.Errorf("expected [1, 0] (success), got %v", authResp)
+	}
+
+	if err := <-done; err != nil {
+		t.Errorf("handshake error: %v", err)
+	}
+}
+
+func TestHandshakeAuthFailure(t *testing.T) {
+	srv := New(&Config{
+		Auth: &AuthConfig{
+			User: "admin",
+			Pass: "secret123",
+		},
+	})
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan error)
+	go func() {
+		done <- srv.handshake(server)
+	}()
+
+	// Client sends: VER(5) + NMETHODS(1) + METHODS(UserPass)
+	client.Write([]byte{Version, 0x01, MethodUserPass})
+
+	// Read server response
+	resp := make([]byte, 2)
+	io.ReadFull(client, resp)
+
+	// Send wrong password
+	authReq := []byte{0x01, 5}
+	authReq = append(authReq, "admin"...)
+	authReq = append(authReq, 5)
+	authReq = append(authReq, "wrong"...)
+	client.Write(authReq)
+
+	// Read auth response (should fail)
+	authResp := make([]byte, 2)
+	io.ReadFull(client, authResp)
+	if authResp[1] != 0x01 {
+		t.Errorf("expected auth failure (status=1), got status=%d", authResp[1])
+	}
+
+	err := <-done
+	if err == nil {
+		t.Error("expected handshake to fail with wrong password")
+	}
+}
+
+func TestHandshakeNoAuthMethodMismatch(t *testing.T) {
+	// Server requires auth, client only supports NoAuth
+	srv := New(&Config{
+		Auth: &AuthConfig{
+			User: "admin",
+			Pass: "secret",
+		},
+	})
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	done := make(chan error)
+	go func() {
+		done <- srv.handshake(server)
+	}()
+
+	// Client sends only NoAuth method
+	client.Write([]byte{Version, 0x01, MethodNoAuth})
+
+	// Read server response (should be NoAcceptable)
+	resp := make([]byte, 2)
+	io.ReadFull(client, resp)
+	if resp[1] != MethodNoAcceptable {
+		t.Errorf("expected MethodNoAcceptable (0xFF), got %d", resp[1])
+	}
+
+	err := <-done
+	if err == nil {
+		t.Error("expected handshake to fail when client doesn't support required auth")
+	}
+}

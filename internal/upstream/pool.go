@@ -105,8 +105,9 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 
 	conn, err := g.sshClient.Dial(network, addr)
 	if err != nil {
-		log.Printf("[WARN] upstream %s: dial failed, will reconnect: %v", g.name, err)
-		// Mark for reconnection, maintain() will handle it
+		log.Printf("[WARN] upstream %s: dial failed, cleaning up for reconnect: %v", g.name, err)
+		// Clean up so maintain() can detect and reconnect
+		g.cleanup()
 		return nil, fmt.Errorf("upstream %s: dial failed: %w", g.name, err)
 	}
 
@@ -181,10 +182,34 @@ func (g *Group) connectToInstance(ctx context.Context, instanceID string) error 
 // maintain monitors connection and reconnects on failure.
 func (g *Group) maintain() {
 	for {
+		// Get adapter Done channel while holding lock briefly
+		g.connMu.Lock()
+		adapter := g.adapter
+		g.connMu.Unlock()
+
+		var adapterDone <-chan struct{}
+		if adapter != nil {
+			adapterDone = adapter.Done()
+		}
+
 		select {
 		case <-g.ctx.Done():
 			return
+
+		case <-adapterDone:
+			// Adapter closed (channel_closed or connection lost)
+			g.connMu.Lock()
+			log.Printf("[INFO] upstream %s: adapter closed, reconnecting...", g.name)
+			g.cleanup()
+			if err := g.connect(g.ctx); err != nil {
+				log.Printf("[ERROR] upstream %s: reconnection failed: %v", g.name, err)
+			} else {
+				log.Printf("[INFO] upstream %s: reconnected via instance %s", g.name, g.instances[g.current])
+			}
+			g.connMu.Unlock()
+
 		case <-time.After(5 * time.Second):
+			// Periodic check for nil references (from dial failures)
 			g.connMu.Lock()
 			if g.sshClient == nil || g.adapter == nil {
 				log.Printf("[INFO] upstream %s: connection lost, reconnecting...", g.name)
