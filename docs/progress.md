@@ -113,6 +113,6 @@ The session-proxy is now fully functional. SSM handshake, SSH tunnel, and SOCKS5
 ## Roadmap (Backlog)
 
 - [ ] CLI flags for all config options
-- [ ] Direct connection when no routes match
+- [x] Direct connection when no routes match
 - [ ] TUN transparent proxy (future project)
 

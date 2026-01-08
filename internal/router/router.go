@@ -6,6 +6,9 @@ import (
 	"strings"
 )
 
+// DirectConnection is a special value indicating direct connection without proxy.
+const DirectConnection = "DIRECT"
+
 // Router matches destination addresses to upstream names.
 type Router struct {
 	rules       []rule

@@ -94,8 +94,10 @@ func NewRoutingServer(cfg *config.Config, r *router.Router, p *upstream.Pool) (*
 
 	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		upstreamName := s.router.Match(addr)
-		if upstreamName == "" {
-			return nil, fmt.Errorf("no upstream matched for %s", addr)
+		// Direct connection when no routes match or explicit DIRECT
+		if upstreamName == "" || upstreamName == router.DirectConnection {
+			var d net.Dialer
+			return d.DialContext(ctx, network, addr)
 		}
 		return s.pool.Dial(ctx, upstreamName, network, addr)
 	}
