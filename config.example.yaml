@@ -1,0 +1,62 @@
+# Session Proxy Configuration Example
+#
+# Place this file at:
+#   - ./config.yaml (current directory)
+#   - ~/.config/session-proxy/config.yaml (XDG default)
+#   - or specify with --config /path/to/config.yaml
+
+listen: "127.0.0.1:28881"
+
+# Optional SOCKS5 authentication (per listen port)
+# auth:
+#   user: admin
+#   pass: secret123
+
+# Define upstream environments
+upstreams:
+  dev:
+    ssh:
+      user: ec2-user
+      # key: ~/.ssh/dev.pem  # Optional, uses ssh-agent if empty
+    aws:
+      profile: default  # Region auto-detected from profile
+    instances:
+      - i-dev-bastion-1
+      - i-dev-bastion-2  # Failover: tried if first fails
+
+  prod:
+    ssh:
+      user: admin
+      key: ~/.ssh/prod.pem
+    aws:
+      profile: prod     # Uses ~/.aws/config [profile prod]
+    instances:
+      - i-prod-bastion-1
+
+  # Example with inline credentials (for CI/CD, NOT recommended for humans)
+  # ci-env:
+  #   ssh:
+  #     user: ubuntu
+  #   aws:
+  #     region: us-west-2   # Required when using ak/sk
+  #     access_key: AKIA...
+  #     secret_key: xxx...
+  #   instances:
+  #     - i-ci-runner-1
+
+# Route traffic to upstreams based on destination
+routes:
+  # CIDR matching
+  - match: "10.0.0.0/8"
+    upstream: dev
+  - match: "10.1.0.0/16"
+    upstream: prod
+
+  # Domain glob matching
+  - match: "*.dev.internal"
+    upstream: dev
+  - match: "*.prod.internal"
+    upstream: prod
+
+# Default upstream if no routes match
+default: dev

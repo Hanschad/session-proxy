@@ -10,3 +10,9 @@
 
 # Agent
 .gemini/
+
+# config files
+/config.yaml
+
+# logs
+/debug.log

@@ -9,20 +9,29 @@ import (
 	"sync"
 )
 
+// AuthConfig holds optional authentication credentials.
+type AuthConfig struct {
+	User string
+	Pass string
+}
+
 // Config holds server configuration
 type Config struct {
 	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	Auth *AuthConfig // Optional authentication
 }
 
 // Server is a SOCKS5 proxy server
 type Server struct {
 	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+	auth *AuthConfig
 }
 
 // New creates a new SOCKS5 server
 func New(cfg *Config) *Server {
 	s := &Server{
 		dial: cfg.Dial,
+		auth: cfg.Auth,
 	}
 	if s.dial == nil {
 		s.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -84,6 +93,32 @@ func (s *Server) handshake(conn net.Conn) error {
 		return fmt.Errorf("read methods: %w", err)
 	}
 
+	// Choose authentication method
+	if s.auth != nil && s.auth.User != "" {
+		// Require username/password authentication
+		hasUserPass := false
+		for _, m := range methods {
+			if m == MethodUserPass {
+				hasUserPass = true
+				break
+			}
+		}
+
+		if !hasUserPass {
+			conn.Write([]byte{Version, MethodNoAcceptable})
+			return fmt.Errorf("client does not support username/password auth")
+		}
+
+		// Request username/password auth
+		if _, err := conn.Write([]byte{Version, MethodUserPass}); err != nil {
+			return err
+		}
+
+		// Perform username/password auth (RFC 1929)
+		return s.authenticateUserPass(conn)
+	}
+
+	// No auth required
 	hasNoAuth := false
 	for _, m := range methods {
 		if m == MethodNoAuth {
@@ -99,6 +134,71 @@ func (s *Server) handshake(conn net.Conn) error {
 
 	_, err := conn.Write([]byte{Version, MethodNoAuth})
 	return err
+}
+
+// authenticateUserPass performs RFC 1929 username/password authentication
+func (s *Server) authenticateUserPass(conn net.Conn) error {
+	// RFC 1929 format:
+	// +----+------+----------+------+----------+
+	// |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+	// +----+------+----------+------+----------+
+	// | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+	// +----+------+----------+------+----------+
+
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return fmt.Errorf("read auth header: %w", err)
+	}
+
+	if header[0] != 0x01 { // VER must be 0x01
+		s.sendAuthReply(conn, 0x01) // Failure
+		return fmt.Errorf("unsupported auth version: %d", header[0])
+	}
+
+	ulen := int(header[1])
+	if ulen == 0 || ulen > 255 {
+		s.sendAuthReply(conn, 0x01)
+		return fmt.Errorf("invalid username length: %d", ulen)
+	}
+
+	username := make([]byte, ulen)
+	if _, err := io.ReadFull(conn, username); err != nil {
+		return fmt.Errorf("read username: %w", err)
+	}
+
+	plenBuf := make([]byte, 1)
+	if _, err := io.ReadFull(conn, plenBuf); err != nil {
+		return fmt.Errorf("read password length: %w", err)
+	}
+	plen := int(plenBuf[0])
+
+	password := make([]byte, plen)
+	if plen > 0 {
+		if _, err := io.ReadFull(conn, password); err != nil {
+			return fmt.Errorf("read password: %w", err)
+		}
+	}
+
+	// Verify credentials
+	if string(username) != s.auth.User || string(password) != s.auth.Pass {
+		s.sendAuthReply(conn, 0x01) // Failure
+		return fmt.Errorf("authentication failed for user %q", string(username))
+	}
+
+	// Success
+	s.sendAuthReply(conn, 0x00)
+	log.Printf("[INFO] socks: authenticated user %q (remote=%s)", string(username), conn.RemoteAddr())
+	return nil
+}
+
+// sendAuthReply sends authentication reply
+func (s *Server) sendAuthReply(conn net.Conn, status byte) {
+	// +----+--------+
+	// |VER | STATUS |
+	// +----+--------+
+	// | 1  |   1    |
+	// +----+--------+
+	conn.Write([]byte{0x01, status})
 }
 
 // Request represents a SOCKS5 request

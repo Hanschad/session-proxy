@@ -19,6 +19,7 @@ type Manager struct {
 	sshUser    string
 	sshKeyPath string
 	socksPort  int
+	awsProfile string
 
 	ssmClient   *ssm.Client
 	adapter     *protocol.Adapter
@@ -39,6 +40,7 @@ type Config struct {
 	SSHUser    string
 	SSHKeyPath string
 	SocksPort  int
+	AWSProfile string
 }
 
 // NewManager creates a new session manager
@@ -49,6 +51,7 @@ func NewManager(cfg Config) *Manager {
 		sshUser:    cfg.SSHUser,
 		sshKeyPath: cfg.SSHKeyPath,
 		socksPort:  cfg.SocksPort,
+		awsProfile: cfg.AWSProfile,
 		retryer:    retry.DefaultRetryer(),
 	}
 }
@@ -94,7 +97,10 @@ func (m *Manager) connect(ctx context.Context) error {
 
 	// 1. Create SSM client if not exists
 	if m.ssmClient == nil {
-		m.ssmClient, err = ssm.NewClient(ctx, m.region)
+		m.ssmClient, err = ssm.NewClient(ctx, ssm.ClientConfig{
+			Region:  m.region,
+			Profile: m.awsProfile,
+		})
 		if err != nil {
 			return err
 		}

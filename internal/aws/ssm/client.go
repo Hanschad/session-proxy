@@ -6,22 +6,60 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	mv2 "github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 type Client struct {
-	svc *mv2.Client
+	svc    *mv2.Client
+	region string
 }
 
-func NewClient(ctx context.Context, region string) (*Client, error) {
-	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+// ClientConfig holds AWS client configuration.
+type ClientConfig struct {
+	Profile   string // Use AWS config profile (region auto-detected)
+	Region    string // Explicit region (required for inline credentials)
+	AccessKey string // For inline credentials
+	SecretKey string
+}
+
+// NewClient creates a new SSM client with the given configuration.
+// If Profile is set, region is auto-detected from AWS config.
+// If AccessKey/SecretKey are set, Region must be provided.
+func NewClient(ctx context.Context, cfg ClientConfig) (*Client, error) {
+	var opts []func(*config.LoadOptions) error
+
+	// Profile mode: load profile, region is auto-detected
+	if cfg.Profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(cfg.Profile))
+	}
+
+	// Explicit region overrides profile region
+	if cfg.Region != "" {
+		opts = append(opts, config.WithRegion(cfg.Region))
+	}
+
+	// Inline credentials mode
+	if cfg.AccessKey != "" && cfg.SecretKey != "" {
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cfg.AccessKey, cfg.SecretKey, ""),
+		))
+	}
+
+	awsCfg, err := config.LoadDefaultConfig(ctx, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to load SDK config: %w", err)
 	}
 
 	return &Client{
-		svc: mv2.NewFromConfig(cfg),
+		svc:    mv2.NewFromConfig(awsCfg),
+		region: awsCfg.Region,
 	}, nil
+}
+
+// Region returns the resolved region for this client.
+func (c *Client) Region() string {
+	return c.region
 }
 
 type Session struct {
@@ -56,8 +94,6 @@ func (c *Client) StartSession(ctx context.Context, instanceID string) (*Session,
 }
 
 // ResumeSession resumes an existing session to get a new token.
-// This is used for reconnection after a network interruption.
-// The session must still be valid on the server side.
 func (c *Client) ResumeSession(ctx context.Context, sessionID string) (*Session, error) {
 	input := &mv2.ResumeSessionInput{
 		SessionId: aws.String(sessionID),

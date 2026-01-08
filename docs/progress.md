@@ -70,3 +70,49 @@ The session-proxy is now fully functional. SSM handshake, SSH tunnel, and SOCKS5
     - **Fix**: Implemented `incomingMsgBuffer` and `expectedSeqNum` logic in `Adapter`. Messages are now buffered and processed strictly in sequence order.
     - **Result**: Stable SSH connection and data transfer.
     - **Documentation**: [MESSAGE_REORDER_ISSUE.md](MESSAGE_REORDER_ISSUE.md)
+
+## Jan 8 Features: Multi-Upstream Routing
+
+14. **Configuration System** (`internal/config`):
+    - Viper-based config loading (YAML/TOML).
+    - Search priority: CLI flags > `--config` > `./config.yaml` > XDG path.
+    - SSH credentials now **per upstream** (not global).
+    - AWS profile vs inline credentials validation.
+
+15. **Route-Based Upstream Selection** (`internal/router`):
+    - CIDR matching: `10.0.0.0/8` → upstream `dev`.
+    - Domain glob matching: `*.prod.internal` → upstream `prod`.
+    - Default upstream fallback.
+
+16. **Upstream Pool with Failover** (`internal/upstream`):
+    - Multiple SSH connections managed per upstream group.
+    - **Startup connection**: `Connect()` establishes all connections, fails fast.
+    - **Automatic reconnection**: `maintain()` goroutine monitors and reconnects.
+    - **Passive failover**: On dial failure, tries next instance in list.
+
+17. **AWS Region Auto-Detection**:
+    - When using profile: region auto-detected from AWS config.
+    - When using inline credentials: explicit region required.
+
+18. **SOCKS5 Authentication** (`internal/socks5`):
+    - RFC 1929 username/password authentication.
+    - Optional, configured per listen port.
+
+19. **Backward Compatibility**:
+    - Legacy single-target mode still works: `./session-proxy --target i-xxx`.
+    - New config mode: `./session-proxy` or `./session-proxy --config path/to/config.yaml`.
+
+## Current Status
+
+- ✅ Multi-upstream routing with CIDR/domain matching
+- ✅ Automatic failover within upstream group
+- ✅ SOCKS5 authentication (optional)
+- ✅ 13 tests passing (config: 5, router: 3, socks5: 5)
+- ✅ Backward compatible with legacy CLI mode
+
+## Roadmap (Backlog)
+
+- [ ] CLI flags for all config options
+- [ ] Direct connection when no routes match
+- [ ] TUN transparent proxy (future project)
+

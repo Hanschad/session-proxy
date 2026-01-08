@@ -7,65 +7,108 @@
 - Single binary deployment (Go).
 - Native AWS SSM integration (no external `session-manager-plugin` required).
 - Integrated SOCKS5 proxy server.
+- **Multi-upstream routing** with automatic failover.
+- **Route-based traffic steering** via CIDR and domain patterns.
 
 ## High-Level Architecture
 
+### Single Upstream Mode (Legacy)
+
 ```mermaid
 graph TD
-    User["User/Browser"] -->|SOCKS5 Request| SocksServer[("SOCKS5 Server (Listener)")]
-    SocksServer -->|Encrypted SSH Traffic| SSHClient["Internal SSH Client"]
-    SSHClient -->|Raw Bytes| VirtConn["Virtual Connection Adapter"]
-    VirtConn -->|SSM Protocol Frames| WSClient["WebSocket Client"]
-    WSClient -->|WSS| AWSSSM["AWS SSM Service"]
-    AWSSSM -->|WSS| SSMAgent["SSM Agent (on EC2)"]
-    SSMAgent -->|TCP| TargetDest["Target Destination (via Connect)"]
+    User["User/Browser"] -->|SOCKS5 Request| SocksServer[("SOCKS5 Server")]
+    SocksServer -->|Encrypted SSH Traffic| SSHClient["SSH Client"]
+    SSHClient -->|Raw Bytes| VirtConn["Protocol Adapter"]
+    VirtConn -->|SSM Protocol Frames| WSClient["WebSocket"]
+    WSClient -->|WSS| AWSSSM["AWS SSM"]
+    AWSSSM -->|WSS| SSMAgent["EC2 (SSM Agent)"]
+    SSMAgent -->|TCP| TargetDest["Target"]
+```
+
+### Multi-Upstream Mode (Config-Driven)
+
+```mermaid
+graph TD
+    User["User/Browser"] -->|SOCKS5 Request| SocksServer[("SOCKS5 Server")]
+    SocksServer -->|target address| Router["Router"]
+    Router -->|match 10.0.0.0/8| PoolDev["Upstream Pool: dev"]
+    Router -->|match 10.1.0.0/8| PoolProd["Upstream Pool: prod"]
+    Router -->|no match| Direct["Direct Connection"]
+    PoolDev -->|SSH| EC2Dev["EC2 (dev VPC)"]
+    PoolProd -->|SSH| EC2Prod["EC2 (prod VPC)"]
 ```
 
 ## Component Design
 
-### 1. Application Layer (CLI)
-Entry point responsible for:
-- Parsing command-line arguments (target instance, ports, SSH keys).
-- Initializing the AWS SDK v2 configuration.
-- Wiring together the components.
+### 1. Configuration (`internal/config`)
+- **Viper-based** config loading (YAML/TOML).
+- **Search priority**: CLI flags > `--config` path > `./config.yaml` > `$XDG_CONFIG_HOME/session-proxy/config.yaml`
+- Validates AWS profile vs inline credentials.
+- SSH credentials per upstream.
 
-### 2. SSM Connector (`internal/aws/ssm`)
-Responsible for the specific interaction with AWS APIs.
-- **Input**: Instance ID, verify target status.
-- **Action**: Call `StartSession` with document `AWS-StartSSHSession`.
-- **Output**: Session Token, Stream URL.
+### 2. Router (`internal/router`)
+Matches destination addresses to upstream names.
+- **CIDR matching**: `10.0.0.0/8` → upstream `dev`
+- **Domain glob matching**: `*.prod.internal` → upstream `prod`
+- Returns default upstream if no match.
 
-### 3. Protocol Adapter (`internal/protocol`)
-The core innovation piece. It translates between Go's standard `net.Conn` stream and the message-based AWS SSM Protocol.
+### 3. Upstream Pool (`internal/upstream`)
+Manages multiple SSM/SSH connections.
 
-**Key responsibilities:**
-- **Framing**: Serializing/Deserializing the SSM binary protocol (Payload type, Sequence number, Flags).
-- **Buffering**: Handling the difference between stream-based SSH reads and packet-based SSM payloads.
-- **Heartbeats**: Maintaining the WebSocket connection.
+**Lifecycle:**
+1. **Startup**: `Connect()` establishes all connections (fail → exit).
+2. **Runtime**: `maintain()` goroutine monitors and reconnects.
+3. **Failover**: On dial failure, tries next instance in list.
 
-**Interface:**
 ```go
-type SSMConnection interface {
-    net.Conn // Implements Read/Write/Close/LocalAddr/RemoteAddr...
+type Pool struct {
+    groups map[string]*Group  // Keyed by upstream name
+}
+
+type Group struct {
+    instances []string  // Failover list
+    current   int       // Current active instance
+    sshClient *ssh.Client
 }
 ```
 
-**Protocol Details**:
-The adapter must handle the following payload types:
-- `Output_Stream_Data`: Received from AWS (Remote data).
-- `Input_Stream_Data`: Sent to AWS (User data).
-- `Acknowledge`: Handling flow control if necessary.
+### 4. SSM Connector (`internal/aws/ssm`)
+- **Profile mode**: Region auto-detected from AWS config.
+- **Inline mode**: Requires explicit region + access_key + secret_key.
 
-### 4. SSH Tunnel (`internal/ssh`)
-Wraps the `SSMConnection` with an SSH handshake.
+```go
+type ClientConfig struct {
+    Profile   string  // Use AWS config profile
+    Region    string  // Explicit region (for inline creds)
+    AccessKey string
+    SecretKey string
+}
+```
+
+### 5. Protocol Adapter (`internal/protocol`)
+Translates between `net.Conn` stream and SSM binary protocol.
+
+**Message Structure (116-byte header):**
+```
+Offset  Size  Field
+------  ----  -----
+0       4     HeaderLength (116)
+4       32    MessageType
+44      8     SequenceNumber
+60      16    MessageId
+108     4     PayloadType
+112     4     PayloadLength
+116     N     Payload
+```
+
+### 6. SSH Tunnel (`internal/ssh`)
 - Uses `golang.org/x/crypto/ssh`.
-- Performs authentication (Private Key/Agent).
-- Establishes the secure tunnel *inside* the SSM session.
+- Supports private key or ssh-agent authentication.
+- Credentials configured per upstream.
 
-### 5. SOCKS5 Proxy (`internal/proxy`)
-Listens on a local port (e.g., 28881) and proxies traffic via the SSH Tunnel.
-- Validates SOCKS5 handshake.
-- Uses the `SSHClient.Dial` to forward connections, effectively making the EC2 instance the exit node.
+### 7. SOCKS5 Proxy (`internal/socks5`)
+- **RFC 1929 authentication** (optional username/password).
+- Uses router to select upstream, then dials via SSH.
 
 ## Data Flow Sequence
 
@@ -73,118 +116,87 @@ Listens on a local port (e.g., 28881) and proxies traffic via the SSH Tunnel.
 sequenceDiagram
     participant User
     participant Proxy as session-proxy
-    participant AWS as AWS API
-    participant EC2 as EC2 (SSM Agent)
+    participant Router
+    participant Pool as Upstream Pool
+    participant EC2 as EC2 Instance
 
-    Note over User, Proxy: Initialization
-    User->>Proxy: Run (Target: i-xxx)
-    Proxy->>AWS: StartSession(i-xxx)
-    AWS-->>Proxy: Session Token & WSS URL
+    Note over Proxy: Startup
+    Proxy->>Pool: Connect() all upstreams
+    Pool->>EC2: SSM + SSH handshake
+    EC2-->>Pool: Connected
 
-    Note over Proxy, EC2: Transport Establishment
-    Proxy->>AWS: WebSocket Connect
-    AWS->>EC2: Signal Session Start
-    Proxy->>Proxy: Upgrade WS to net.Conn
-    Proxy->>EC2: SSH Handshake (over WS)
-    EC2-->>Proxy: SSH Accepted
-
-    Note over User, Proxy: Traffic Forwarding
-    User->>Proxy: SOCKS5 Connect (google.com:80)
-    Proxy->>EC2: SSH Direct-TCP-IP (google.com:80)
-    EC2->>Internet: Connect google.com:80
-    Internet-->>EC2: Response
-    EC2-->>Proxy: Encrypted SSH Frame
+    Note over User, Proxy: Request
+    User->>Proxy: SOCKS5 CONNECT 10.0.1.5:80
+    Proxy->>Router: Match(10.0.1.5:80)
+    Router-->>Proxy: upstream=dev
+    Proxy->>Pool: Dial(dev, tcp, 10.0.1.5:80)
+    Pool->>EC2: SSH Direct-TCP-IP
+    EC2->>Target: TCP Connect
+    Target-->>EC2: Response
+    EC2-->>Pool: SSH Frame
+    Pool-->>Proxy: net.Conn
     Proxy-->>User: SOCKS5 Data
 ```
 
+## Configuration Example
 
-### 6. Low-Level Protocol Specification
+```yaml
+listen: "127.0.0.1:28881"
 
-The SSM Agent communication uses a **binary message format** over WebSocket (not JSON headers).
+auth:  # Optional SOCKS5 authentication
+  user: admin
+  pass: secret
 
-**Message Structure (Total Header = 116 bytes fixed):**
-```
-Offset  Size  Field
-------  ----  -----
-0       4     HeaderLength (always 116, BigEndian)
-4       32    MessageType (null-padded string: "input_stream_data", "output_stream_data", "acknowledge")
-36      4     SchemaVersion (BigEndian, always 1)
-40      8     CreatedDate (BigEndian, milliseconds since epoch)
-44      8     SequenceNumber (BigEndian, starts at 0)
-52      8     Flags (BigEndian, 0=data, 1=SYN, 2=FIN, 3=ACK)
-60      16    MessageId (UUID bytes, big-endian)
-76      32    PayloadDigest (SHA256 of payload)
-108     4     PayloadType (BigEndian)
-112     4     PayloadLength (BigEndian)
-116     N     Payload (N = PayloadLength bytes)
-```
+upstreams:
+  dev:
+    ssh:
+      user: ec2-user
+    aws:
+      profile: default  # Region auto-detected
+    instances: [i-dev-1, i-dev-2]
 
-**PayloadType Values:**
-| Value | Name | Direction | Description |
-|-------|------|-----------|-------------|
-| 0 | Output | Agent→Plugin | Shell output data |
-| 1 | StdOut | Agent→Plugin | Standard output (Port forwarding) |
-| 5 | HandshakeRequest | Agent→Plugin | Session handshake initiation |
-| 6 | HandshakeResponse | Plugin→Agent | Handshake acknowledgment |
-| 7 | HandshakeComplete | Agent→Plugin | Handshake completion |
+  prod:
+    ssh:
+      user: admin
+      key: ~/.ssh/prod.pem
+    aws:
+      profile: prod
+    instances: [i-prod-1]
 
-**Critical: Sequence Number Handling**
-- First message MUST have `SequenceNumber = 0`
-- Agent validates `SequenceNumber == ExpectedSequenceNumber` (starts at 0)
-- Messages with wrong sequence are silently dropped (ACKed but not processed)
+routes:
+  - match: "10.0.0.0/8"
+    upstream: dev
+  - match: "*.prod.internal"
+    upstream: prod
 
-**Acknowledge Payload Format (JSON):**
-```json
-{
-    "AcknowledgedMessageType": "output_stream_data",
-    "AcknowledgedMessageId": "uuid-string",
-    "AcknowledgedMessageSequenceNumber": 0,
-    "IsSequentialMessage": true
-}
+default: dev
 ```
 
-**Handshake Flow:**
-1. Agent → Plugin: `HandshakeRequest` (PayloadType=5, Seq=0)
-2. Plugin → Agent: ACK + `HandshakeResponse` (PayloadType=6, Seq=0)
-3. Agent → Plugin: `HandshakeComplete` (PayloadType=7, Seq=1)
-4. Session ready for data transfer
-
-## Security Considerations
-
-1.  **IAM Permissions**:
-    The user's AWS credential must have `ssm:StartSession` permission on the target resource.
-    
-    ```json
-    {
-        "Effect": "Allow",
-        "Action": "ssm:StartSession",
-        "Resource": "arn:aws:ec2:region:account:instance/i-xxx",
-        "Condition": {
-            "StringEquals": {
-                "ssm:document/name": "AWS-StartSSHSession"
-            }
-        }
-    }
-    ```
-
-2.  **End-to-End Encryption**:
-    - **Layer 1 (TLS)**: WebSocket connection to AWS is TLS encrypted.
-    - **Layer 2 (SSH)**: The inner tunnel is standard SSH (AES/ChaCha20), ensuring AWS cannot inspect the traffic content, only the metadata.
-
-3.  **Host Key Verification**:
-    The SSH client *must* perform host key verification. Since we are connecting via a proxy, standard `known_hosts` checks apply. Users must verify the fingerprint upon first connection.
-
-## Directory Structure Strategy
+## Directory Structure
 
 ```text
 /
 ├── cmd/
 │   └── session-proxy/    # Main entry point
 ├── internal/
-│   ├── aws/              # AWS SDK interactions (SSM StartSession)
-│   ├── protocol/         # SSM <-> net.Conn adapter (Reads/Writes frames)
-│   ├── ssh/              # SSH Client wrapper & Dial logic
-│   └── proxy/            # SOCKS5 Server implementation
-├── pkg/                  # (Optional) Reusable libraries
+│   ├── aws/ssm/          # AWS SSM client
+│   ├── config/           # Configuration loading
+│   ├── protocol/         # SSM <-> net.Conn adapter
+│   ├── proxy/            # SOCKS5 Server (legacy + routing)
+│   ├── router/           # Route matching
+│   ├── session/          # Legacy single-upstream manager
+│   ├── socks5/           # SOCKS5 protocol implementation
+│   ├── ssh/              # SSH client wrapper
+│   └── upstream/         # Multi-upstream pool
+├── config.example.yaml   # Example configuration
 └── docs/                 # Documentation
 ```
+
+## Security Considerations
+
+1. **IAM Permissions**: Required `ssm:StartSession` on target instances.
+2. **End-to-End Encryption**: TLS (WebSocket) + SSH (inner tunnel).
+3. **Credential Storage**: 
+   - Use AWS profiles (not inline credentials).
+   - SSH keys should be protected or use ssh-agent.
+4. **SOCKS5 Authentication**: Optional but recommended for shared networks.
