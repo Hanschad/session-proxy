@@ -5,10 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"os"
 	"sync"
 
-	"github.com/armon/go-socks5"
+	"github.com/hanschad/session-proxy/internal/socks5"
 	sshlib "golang.org/x/crypto/ssh"
 )
 
@@ -17,7 +16,6 @@ type Server struct {
 	socksSrv *socks5.Server
 	listener net.Listener
 
-	// Dynamic SSH client reference for transparent reconnection
 	sshClient   *sshlib.Client
 	sshClientMu sync.RWMutex
 }
@@ -28,7 +26,6 @@ func NewServer(port int, sshClient *sshlib.Client) (*Server, error) {
 		sshClient: sshClient,
 	}
 
-	// Create dialer that uses the current SSH client
 	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
 		client := s.getSSHClient()
 		if client == nil {
@@ -37,26 +34,13 @@ func NewServer(port int, sshClient *sshlib.Client) (*Server, error) {
 		return client.Dial(network, addr)
 	}
 
-	// Custom logger with [ERROR] prefix for go-socks5
-	socksLogger := log.New(os.Stderr, "", log.LstdFlags)
-	socksLogger.SetPrefix("[ERROR] socks: ")
-
-	conf := &socks5.Config{
-		Dial:   dialer,
-		Logger: socksLogger,
-	}
-
-	srv, err := socks5.New(conf)
-	if err != nil {
-		return nil, err
-	}
-	s.socksSrv = srv
+	s.socksSrv = socks5.New(&socks5.Config{
+		Dial: dialer,
+	})
 
 	return s, nil
 }
 
-// UpdateSSHClient updates the SSH client reference for transparent reconnection.
-// Existing connections will fail, but new connections will use the new client.
 func (s *Server) UpdateSSHClient(client *sshlib.Client) {
 	s.sshClientMu.Lock()
 	defer s.sshClientMu.Unlock()
@@ -64,7 +48,6 @@ func (s *Server) UpdateSSHClient(client *sshlib.Client) {
 	log.Printf("[INFO] SOCKS5 dialer updated with new SSH client")
 }
 
-// getSSHClient returns the current SSH client (thread-safe)
 func (s *Server) getSSHClient() *sshlib.Client {
 	s.sshClientMu.RLock()
 	defer s.sshClientMu.RUnlock()

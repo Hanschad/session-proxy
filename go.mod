@@ -3,13 +3,13 @@ module github.com/hanschad/session-proxy
 go 1.25.5
 
 require (
-	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
 	github.com/aws/aws-sdk-go-v2 v1.41.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.6
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.67.7
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
 	golang.org/x/crypto v0.46.0
+	golang.org/x/term v0.38.0
 )
 
 require (
@@ -25,7 +25,5 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.12 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.5 // indirect
 	github.com/aws/smithy-go v1.24.0 // indirect
-	golang.org/x/net v0.47.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
-	golang.org/x/term v0.38.0 // indirect
 )
