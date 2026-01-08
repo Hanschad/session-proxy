@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // AuthConfig holds optional authentication credentials.
@@ -232,7 +233,8 @@ func (s *Server) readRequest(conn net.Conn) (*Request, error) {
 
 // handleConnect handles CONNECT command
 func (s *Server) handleConnect(conn net.Conn, req *Request) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	target := req.Addr.String()
 
 	remote, err := s.dial(ctx, "tcp", target)

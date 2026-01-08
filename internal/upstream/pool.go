@@ -95,23 +95,42 @@ func (p *Pool) Dial(ctx context.Context, upstreamName, network, addr string) (ne
 }
 
 // dial attempts to connect through the group's SSH client.
+// Uses goroutine + select to respect context timeout since SSH Dial doesn't accept context.
 func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	g.connMu.Lock()
-	defer g.connMu.Unlock()
+	client := g.sshClient
+	g.connMu.Unlock()
 
-	if g.sshClient == nil {
+	if client == nil {
 		return nil, fmt.Errorf("upstream %s: not connected", g.name)
 	}
 
-	conn, err := g.sshClient.Dial(network, addr)
-	if err != nil {
-		log.Printf("[WARN] upstream %s: dial failed, cleaning up for reconnect: %v", g.name, err)
-		// Clean up so maintain() can detect and reconnect
-		g.cleanup()
-		return nil, fmt.Errorf("upstream %s: dial failed: %w", g.name, err)
+	type dialResult struct {
+		conn net.Conn
+		err  error
 	}
+	resultCh := make(chan dialResult, 1)
 
-	return conn, nil
+	go func() {
+		conn, err := client.Dial(network, addr)
+		resultCh <- dialResult{conn, err}
+	}()
+
+	select {
+	case <-ctx.Done():
+		// Timeout or cancellation - connection will be orphaned but GCed
+		return nil, fmt.Errorf("upstream %s: dial timeout: %w", g.name, ctx.Err())
+
+	case result := <-resultCh:
+		if result.err != nil {
+			log.Printf("[WARN] upstream %s: dial failed, cleaning up for reconnect: %v", g.name, result.err)
+			g.connMu.Lock()
+			g.cleanup()
+			g.connMu.Unlock()
+			return nil, fmt.Errorf("upstream %s: dial failed: %w", g.name, result.err)
+		}
+		return result.conn, nil
+	}
 }
 
 // connect establishes SSM → SSH connection with failover.
