@@ -4,6 +4,7 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // DirectConnection is a special value indicating direct connection without proxy.
@@ -11,6 +12,7 @@ const DirectConnection = "DIRECT"
 
 // Router matches destination addresses to upstream names.
 type Router struct {
+	mu          sync.RWMutex
 	rules       []rule
 	defaultName string
 }
@@ -33,23 +35,35 @@ type Config struct {
 // New creates a new Router from configuration.
 func New(cfg Config) *Router {
 	r := &Router{defaultName: cfg.Default}
+	r.rules = parseRules(cfg.Routes)
+	return r
+}
 
-	for _, route := range cfg.Routes {
+// Update replaces the router rules with new configuration (hot reload).
+func (r *Router) Update(cfg Config) {
+	newRules := parseRules(cfg.Routes)
+
+	r.mu.Lock()
+	r.rules = newRules
+	r.defaultName = cfg.Default
+	r.mu.Unlock()
+}
+
+func parseRules(routes []struct{ Match, Upstream string }) []rule {
+	var rules []rule
+	for _, route := range routes {
 		rl := rule{upstream: route.Upstream}
 
-		// Try to parse as CIDR
 		_, cidr, err := net.ParseCIDR(route.Match)
 		if err == nil {
 			rl.cidr = cidr
 		} else {
-			// Treat as domain glob pattern
 			rl.domain = strings.ToLower(route.Match)
 		}
 
-		r.rules = append(r.rules, rl)
+		rules = append(rules, rl)
 	}
-
-	return r
+	return rules
 }
 
 // Match returns the upstream name for the given address.
