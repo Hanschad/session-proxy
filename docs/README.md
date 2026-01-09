@@ -20,3 +20,4 @@
 | Document | Description |
 |----------|-------------|
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [ROADMAP.md](ROADMAP.md) | Future features and backlog |
