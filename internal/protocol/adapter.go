@@ -39,8 +39,8 @@ type Adapter struct {
 	handshakeDone         chan struct{}
 	lastHandshakeResponse *AgentMessage // Saved for retransmission
 
-	// Message deduplication
-	seenMsgIds   map[uuid.UUID]bool
+	// Message deduplication (stores sequence number for age-based eviction)
+	seenMsgIds   map[uuid.UUID]int64
 	seenMsgIdsMu sync.Mutex
 
 	// Message reordering (per AWS protocol)
@@ -53,11 +53,11 @@ type Adapter struct {
 	closeOnce sync.Once
 }
 
-// ClientVersion is the version reported to the SSM service
+// ClientVersion is the SSM protocol version reported to AWS SSM service.
+// Must match session-manager-plugin version format. Do not change unless protocol changes.
 const ClientVersion = "1.2.0.0"
 
 // PingInterval is the interval for sending WebSocket ping frames to keep the connection alive.
-// Matches AWS session-manager-plugin behavior (5 minutes).
 const PingInterval = 1 * time.Minute
 
 func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) {
@@ -99,7 +99,7 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		conn:              wsConn,
 		reader:            pr,
 		writer:            pw,
-		seenMsgIds:        make(map[uuid.UUID]bool),
+		seenMsgIds:        make(map[uuid.UUID]int64),
 		handshakeDone:     make(chan struct{}),
 		done:              make(chan struct{}),
 		incomingMsgBuffer: make(map[int64]*AgentMessage),
@@ -167,7 +167,7 @@ func (a *Adapter) readMessage() (*AgentMessage, error) {
 
 // dispatchMessage routes message to appropriate handler. Returns false if channel closed.
 func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
-	isDuplicate := a.markMessageSeen(msg.Header.MessageId)
+	isDuplicate := a.markMessageSeen(msg.Header.MessageId, msg.Header.SequenceNumber)
 
 	switch msg.Header.MessageType {
 	case MsgTypeOutputStreamData:
@@ -185,25 +185,32 @@ func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
 }
 
 // markMessageSeen checks and marks a message ID as seen. Returns true if duplicate.
-// Prunes oldest entries when map exceeds maxSeenMsgIds to prevent memory leak.
+// Evicts oldest entry (lowest sequence number) when map exceeds maxSeenMsgIds.
 const maxSeenMsgIds = 1000
 
-func (a *Adapter) markMessageSeen(id uuid.UUID) bool {
+func (a *Adapter) markMessageSeen(id uuid.UUID, seq int64) bool {
 	a.seenMsgIdsMu.Lock()
 	defer a.seenMsgIdsMu.Unlock()
 
-	isDuplicate := a.seenMsgIds[id]
-	if !isDuplicate {
-		// Prune if map is too large (delete one random entry)
-		if len(a.seenMsgIds) >= maxSeenMsgIds {
-			for k := range a.seenMsgIds {
-				delete(a.seenMsgIds, k)
-				break
+	if _, exists := a.seenMsgIds[id]; exists {
+		return true
+	}
+
+	// Evict oldest message (lowest sequence number)
+	if len(a.seenMsgIds) >= maxSeenMsgIds {
+		var oldestId uuid.UUID
+		var oldestSeq int64 = 1<<63 - 1 // math.MaxInt64
+		for k, v := range a.seenMsgIds {
+			if v < oldestSeq {
+				oldestSeq = v
+				oldestId = k
 			}
 		}
-		a.seenMsgIds[id] = true
+		delete(a.seenMsgIds, oldestId)
 	}
-	return isDuplicate
+
+	a.seenMsgIds[id] = seq
+	return false
 }
 
 // handleOutputStream processes output_stream_data messages based on PayloadType

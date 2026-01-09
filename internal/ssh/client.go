@@ -63,11 +63,13 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 		}))
 	}
 
+	// WARNING: InsecureIgnoreHostKey accepts any host key.
+	// This is acceptable for SSM tunnels (already authenticated via AWS IAM),
+	// but a known_hosts implementation would be more secure.
 	clientConfig := &sshlib.ClientConfig{
 		User:            cfg.User,
 		Auth:            authMethods,
-		HostKeyCallback: sshlib.InsecureIgnoreHostKey(), // TODO: Make this secure via known_hosts
-		// HostKeyCallback: sshlib.FixedHostKey(pk), // Ideally we read multiple keys
+		HostKeyCallback: sshlib.InsecureIgnoreHostKey(),
 	}
 
 	// The "address" for NewClientConn is mostly for logging/verification,

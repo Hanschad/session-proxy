@@ -69,6 +69,9 @@ func parseRules(routes []struct{ Match, Upstream string }) []rule {
 // Match returns the upstream name for the given address.
 // Address can be "host:port" or just "host".
 func (r *Router) Match(addr string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr

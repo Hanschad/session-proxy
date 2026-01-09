@@ -1,18 +1,43 @@
 # Binaries
 /session-proxy
+/bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
 
 # OS specific
 .DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Agent
+# Agent / AI
 .gemini/
+.cursor/
+AGENT.md
 
-# config files
+# Config files (may contain credentials)
 /config.yaml
+/config.toml
 
-# logs
+# Logs
+*.log
 /debug.log
+
+# Temporary files
+tmp/
+.tmp/
