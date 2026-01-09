@@ -41,3 +41,6 @@ AGENT.md
 # Temporary files
 tmp/
 .tmp/
+
+# Distribution
+dist/
