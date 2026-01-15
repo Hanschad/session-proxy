@@ -7,8 +7,13 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/hanschad/session-proxy/internal/trace"
 )
+
+var nextConnID uint64
 
 // AuthConfig holds optional authentication credentials.
 type AuthConfig struct {
@@ -57,23 +62,39 @@ func (s *Server) Serve(l net.Listener) error {
 func (s *Server) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	connID := atomic.AddUint64(&nextConnID, 1)
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("[INFO] socks: accepted conn=%d remote=%s", connID, remoteAddr)
+
+	// Apply short deadlines for initial negotiation to avoid hanging goroutines.
+	// After CONNECT succeeds, we clear deadlines for long-lived streams.
+	if tc, ok := conn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(30 * time.Second)
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := s.handshake(conn); err != nil {
-		log.Printf("[ERROR] socks: handshake failed: %v (remote=%s)", err, conn.RemoteAddr())
+		log.Printf("[ERROR] socks: handshake failed: conn=%d remote=%s err=%v", connID, remoteAddr, err)
 		return
 	}
 
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	req, err := s.readRequest(conn)
 	if err != nil {
-		log.Printf("[ERROR] socks: read request failed: %v (remote=%s)", err, conn.RemoteAddr())
+		log.Printf("[ERROR] socks: read request failed: conn=%d remote=%s err=%v", connID, remoteAddr, err)
 		return
 	}
+
+	// Clear deadlines after negotiation.
+	_ = conn.SetDeadline(time.Time{})
 
 	switch req.Cmd {
 	case CmdConnect:
-		s.handleConnect(conn, req)
+		s.handleConnect(conn, req, connID, remoteAddr)
 	default:
 		s.sendReply(conn, RepCommandNotSupported, nil)
-		log.Printf("[WARN] socks: unsupported command %d (remote=%s)", req.Cmd, conn.RemoteAddr())
+		log.Printf("[WARN] socks: unsupported command conn=%d cmd=%d remote=%s", connID, req.Cmd, remoteAddr)
 	}
 }
 
@@ -232,14 +253,17 @@ func (s *Server) readRequest(conn net.Conn) (*Request, error) {
 }
 
 // handleConnect handles CONNECT command
-func (s *Server) handleConnect(conn net.Conn, req *Request) {
+func (s *Server) handleConnect(conn net.Conn, req *Request, connID uint64, clientRemoteAddr string) {
+	dialStart := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx = trace.WithConnID(ctx, connID)
 	defer cancel()
 	target := req.Addr.String()
 
 	remote, err := s.dial(ctx, "tcp", target)
 	if err != nil {
-		log.Printf("[ERROR] socks: dial failed: target=%s error=%q", target, err)
+		log.Printf("[ERROR] socks: dial failed: conn=%d target=%s remote=%s dur=%s err=%q",
+			connID, target, clientRemoteAddr, time.Since(dialStart), err)
 		s.sendReplyError(conn, err)
 		return
 	}
@@ -248,37 +272,56 @@ func (s *Server) handleConnect(conn net.Conn, req *Request) {
 	bindAddr := AddrFromNetAddr(remote.LocalAddr())
 
 	if err := s.sendReply(conn, RepSuccess, bindAddr); err != nil {
-		log.Printf("[ERROR] socks: send reply failed: %v", err)
+		log.Printf("[ERROR] socks: send reply failed: conn=%d target=%s remote=%s err=%v", connID, target, clientRemoteAddr, err)
 		return
 	}
 
-	log.Printf("[INFO] socks: connected target=%s remote=%s", target, conn.RemoteAddr())
+	log.Printf("[INFO] socks: connected conn=%d target=%s remote=%s dial=%s",
+		connID, target, clientRemoteAddr, time.Since(dialStart))
 
-	s.relay(conn, remote)
+	s.relay(connID, target, clientRemoteAddr, conn, remote)
 }
 
-// relay copies data between two connections
-func (s *Server) relay(client, remote net.Conn) {
+// relay copies data between two connections.
+// It logs per-connection transfer stats to aid debugging (e.g. large image uploads).
+func (s *Server) relay(connID uint64, target, clientRemoteAddr string, client, remote net.Conn) {
+	start := time.Now()
+
+	type copyResult struct {
+		n   int64
+		err error
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 
+	var c2r copyResult // client -> remote
+	var r2c copyResult // remote -> client
+
 	go func() {
 		defer wg.Done()
-		io.Copy(remote, client)
+		buf := make([]byte, 32*1024)
+		n, err := io.CopyBuffer(remote, client, buf)
+		c2r = copyResult{n: n, err: err}
 		if tc, ok := remote.(*net.TCPConn); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(client, remote)
+		buf := make([]byte, 32*1024)
+		n, err := io.CopyBuffer(client, remote, buf)
+		r2c = copyResult{n: n, err: err}
 		if tc, ok := client.(*net.TCPConn); ok {
-			tc.CloseWrite()
+			_ = tc.CloseWrite()
 		}
 	}()
 
 	wg.Wait()
+
+	log.Printf("[INFO] socks: closed conn=%d target=%s remote=%s dur=%s up_bytes=%d down_bytes=%d up_err=%v down_err=%v",
+		connID, target, clientRemoteAddr, time.Since(start), c2r.n, r2c.n, c2r.err, r2c.err)
 }
 
 // sendReply sends a SOCKS5 reply

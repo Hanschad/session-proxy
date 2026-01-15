@@ -2,6 +2,7 @@ package protocol
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -127,5 +129,81 @@ func TestAdapterHandshakeAndData(t *testing.T) {
 
 	if string(buf[:n]) != string(testPayload) {
 		t.Errorf("Expected '%s', got '%s'", testPayload, buf[:n])
+	}
+}
+
+func TestAdapterHandleAcknowledge_RemovesOutgoing(t *testing.T) {
+	a := &Adapter{}
+	a.outgoing = make(map[int64]*outgoingMessage)
+	a.outgoingOldestSeq = -1
+	a.maxOutgoingUnackedBytes = defaultMaxOutgoingUnackedBytes
+	a.outgoingCond = sync.NewCond(&a.outgoingMu)
+	a.done = make(chan struct{})
+
+	seq := int64(42)
+	msgID := uuid.New()
+	a.outgoing[seq] = &outgoingMessage{msgID: msgID, data: []byte("frame"), lastSent: time.Now().Add(-300 * time.Millisecond)}
+	a.outgoingOldestSeq = seq
+	a.outgoingBytes = int64(len(a.outgoing[seq].data))
+
+	ack := AcknowledgeContent{
+		MessageType:         MsgTypeInputStreamData,
+		MessageId:           msgID.String(),
+		SequenceNumber:      seq,
+		IsSequentialMessage: true,
+	}
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		t.Fatalf("marshal ack: %v", err)
+	}
+
+	a.handleAcknowledge(&AgentMessage{Header: AgentMessageHeader{MessageType: MsgTypeAcknowledge}, Payload: payload})
+
+	if len(a.outgoing) != 0 {
+		t.Fatalf("expected outgoing to be empty, got %d", len(a.outgoing))
+	}
+	if a.outgoingOldestSeq != -1 {
+		t.Fatalf("expected outgoingOldestSeq=-1, got %d", a.outgoingOldestSeq)
+	}
+	if a.outgoingBytes != 0 {
+		t.Fatalf("expected outgoingBytes=0, got %d", a.outgoingBytes)
+	}
+	if a.rto <= 0 || a.rto > maxRetransmissionTimeout {
+		t.Fatalf("unexpected rto=%v", a.rto)
+	}
+}
+
+func TestAdapterHandleAcknowledge_MismatchIgnored(t *testing.T) {
+	a := &Adapter{}
+	a.outgoing = make(map[int64]*outgoingMessage)
+	a.outgoingOldestSeq = -1
+	a.maxOutgoingUnackedBytes = defaultMaxOutgoingUnackedBytes
+	a.outgoingCond = sync.NewCond(&a.outgoingMu)
+	a.done = make(chan struct{})
+
+	seq := int64(7)
+	wantID := uuid.New()
+	a.outgoing[seq] = &outgoingMessage{msgID: wantID, data: []byte("frame"), lastSent: time.Now().Add(-300 * time.Millisecond)}
+	a.outgoingOldestSeq = seq
+	a.outgoingBytes = int64(len(a.outgoing[seq].data))
+
+	ack := AcknowledgeContent{
+		MessageType:         MsgTypeInputStreamData,
+		MessageId:           uuid.New().String(),
+		SequenceNumber:      seq,
+		IsSequentialMessage: true,
+	}
+	payload, err := json.Marshal(ack)
+	if err != nil {
+		t.Fatalf("marshal ack: %v", err)
+	}
+
+	a.handleAcknowledge(&AgentMessage{Header: AgentMessageHeader{MessageType: MsgTypeAcknowledge}, Payload: payload})
+
+	if len(a.outgoing) != 1 {
+		t.Fatalf("expected outgoing size=1, got %d", len(a.outgoing))
+	}
+	if a.outgoingOldestSeq != seq {
+		t.Fatalf("expected outgoingOldestSeq=%d, got %d", seq, a.outgoingOldestSeq)
 	}
 }

@@ -65,16 +65,15 @@ func TestDialFailureTriggersCleanup(t *testing.T) {
 		instances: []string{"i-test-1"},
 	}
 
-	// Test that when sshClient is nil, dial returns error
-	g.connMu.Lock()
-	g.sshClient = nil
-	g.adapter = nil
-	g.connMu.Unlock()
+	// Test that when connection pool is empty, dial returns error
+	g.connsMu.Lock()
+	g.conns = nil
+	g.connsMu.Unlock()
 
 	ctx := context.Background()
 	_, err := g.dial(ctx, "tcp", "10.0.0.1:80")
 	if err == nil {
-		t.Error("expected error when sshClient is nil")
+		t.Error("expected error when connection pool is empty")
 	}
 }
 
@@ -87,21 +86,21 @@ func TestCleanupSetsNil(t *testing.T) {
 	// Create mock adapter
 	mockAdapt := newMockAdapter()
 
-	// We can't directly assign mockAdapter to g.adapter (type mismatch)
-	// But we can test that cleanup() properly nils the fields
+	// Simulate that conns pool has some entries
+	g.connsMu.Lock()
+	g.conns = []*sshConn{{}} // Empty but non-nil
+	g.connsMu.Unlock()
 
-	// Simulate that adapter and sshClient exist (using type assertion workaround)
-	// For now, just verify the cleanup logic with nil values doesn't panic
-	g.connMu.Lock()
+	// Verify cleanup properly nils the pool
+	g.connsMu.Lock()
 	g.cleanup()
-	g.connMu.Unlock()
+	g.connsMu.Unlock()
 
-	if g.sshClient != nil {
-		t.Error("expected sshClient to be nil after cleanup")
+	g.connsMu.RLock()
+	if g.conns != nil {
+		t.Error("expected conns to be nil after cleanup")
 	}
-	if g.adapter != nil {
-		t.Error("expected adapter to be nil after cleanup")
-	}
+	g.connsMu.RUnlock()
 
 	_ = mockAdapt // Suppress unused warning
 }
@@ -144,7 +143,7 @@ func TestPoolClose(t *testing.T) {
 	}
 }
 
-func TestGroupMaintainDetectsNilClient(t *testing.T) {
+func TestGroupMaintainDetectsEmptyPool(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -153,8 +152,7 @@ func TestGroupMaintainDetectsNilClient(t *testing.T) {
 		instances: []string{"i-test-1"},
 		ctx:       ctx,
 		cancel:    cancel,
-		sshClient: nil, // Simulates disconnected state
-		adapter:   nil,
+		conns:     nil, // Simulates disconnected state
 	}
 
 	// Run maintain for a short time
@@ -165,10 +163,10 @@ func TestGroupMaintainDetectsNilClient(t *testing.T) {
 		// Just verify it doesn't panic
 		defer close(done)
 
-		// Check the nil detection logic directly
-		g.connMu.Lock()
-		isDisconnected := g.sshClient == nil || g.adapter == nil
-		g.connMu.Unlock()
+		// Check the pool empty detection logic directly
+		g.connsMu.RLock()
+		isDisconnected := len(g.conns) == 0
+		g.connsMu.RUnlock()
 
 		if !isDisconnected {
 			t.Error("expected disconnected state to be detected")

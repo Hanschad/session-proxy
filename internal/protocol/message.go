@@ -18,6 +18,8 @@ const (
 	MsgTypeInputStreamData  = "input_stream_data"
 	MsgTypeAcknowledge      = "acknowledge"
 	MsgTypeChannelClosed    = "channel_closed"
+	MsgTypePausePublication = "pause_publication"
+	MsgTypeStartPublication = "start_publication"
 
 	SchemaVersion = 1
 

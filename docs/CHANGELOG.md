@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## v0.0.4 (Jan 15, 2026)
+
+### Reliability / Large Transfers
+- Implemented MGS flow-control handling (`pause_publication` / `start_publication`)
+- Added outgoing ACK tracking + retransmission loop (oldest-only resend)
+- Added backpressure for TCP->SSM bridging with `SESSION_PROXY_SSM_MAX_UNACKED_BYTES`
+- Default tuning aligned for stability: chunk size 1024, conservative default unacked window 256KB
+
+### Observability
+- Reduced debug log spam for outgoing backpressure (log-once per wait cycle)
+
+### Tests & Docs
+- Added unit tests for ACK/outgoing removal and mismatch handling
+- Added troubleshooting doc: `large-transfer-stability.md`
+
 ## v0.0.3 (Jan 9, 2026)
 
 ### Code Quality

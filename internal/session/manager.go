@@ -66,7 +66,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		}
 
 		// Use exponential backoff retryer for connection attempts
-		err := m.retryer.Run(func() error {
+		err := m.retryer.RunContext(ctx, func() error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()

@@ -14,6 +14,7 @@
 | [handshake-fix.md](handshake-fix.md) | UUID byte order & MessageType padding |
 | [message-reorder-fix.md](message-reorder-fix.md) | SSH stream corruption fix |
 | [connection-maintenance.md](connection-maintenance.md) | Keep-alive & ResumeSession analysis |
+| [large-transfer-stability.md](large-transfer-stability.md) | Docker push / large uploads stability (flow-control, backpressure) |
 
 ## Meta
 

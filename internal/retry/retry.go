@@ -1,6 +1,7 @@
 package retry
 
 import (
+	"context"
 	"math"
 	"math/rand"
 	"time"
@@ -17,6 +18,8 @@ type ExponentialRetryer struct {
 	Multiplier float64
 	// MaxAttempts is the maximum number of retry attempts. 0 means infinite.
 	MaxAttempts int
+
+	rng *rand.Rand
 }
 
 // DefaultRetryer returns a retryer with sensible defaults matching AWS behavior.
@@ -26,16 +29,28 @@ func DefaultRetryer() *ExponentialRetryer {
 		MaxDelay:     30 * time.Second,
 		Multiplier:   2.0,
 		MaxAttempts:  10,
+		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
 // Run executes the given function with exponential backoff retries.
 // Returns nil on success, or the last error if all retries are exhausted.
 func (r *ExponentialRetryer) Run(fn func() error) error {
+	return r.RunContext(context.Background(), fn)
+}
+
+// RunContext is like Run but stops sleeping/retrying when ctx is canceled.
+func (r *ExponentialRetryer) RunContext(ctx context.Context, fn func() error) error {
 	var lastErr error
 	attempt := 0
 
 	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		lastErr = fn()
 		if lastErr == nil {
 			return nil
@@ -47,7 +62,15 @@ func (r *ExponentialRetryer) Run(fn func() error) error {
 		}
 
 		delay := r.nextDelay(attempt)
-		time.Sleep(delay)
+		t := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !t.Stop() {
+				<-t.C
+			}
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 }
 
@@ -61,7 +84,11 @@ func (r *ExponentialRetryer) nextDelay(attempt int) time.Duration {
 	}
 
 	// Add jitter: random value between 0 and 25% of delay
-	jitter := rand.Float64() * delay * 0.25
+	rng := r.rng
+	if rng == nil {
+		rng = rand.New(rand.NewSource(time.Now().UnixNano()))
+	}
+	jitter := rng.Float64() * delay * 0.25
 	delay += jitter
 
 	return time.Duration(delay)

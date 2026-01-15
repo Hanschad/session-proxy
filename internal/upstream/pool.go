@@ -2,23 +2,83 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hanschad/session-proxy/internal/aws/ssm"
 	"github.com/hanschad/session-proxy/internal/config"
 	"github.com/hanschad/session-proxy/internal/protocol"
 	internalssh "github.com/hanschad/session-proxy/internal/ssh"
+	"github.com/hanschad/session-proxy/internal/trace"
 	gossh "golang.org/x/crypto/ssh"
 )
+
+func debugLog(format string, args ...interface{}) {
+	if protocol.DebugMode {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
+
+var nextSSHConnID uint64
 
 // Pool manages multiple upstream connections.
 type Pool struct {
 	groups map[string]*Group
 	mu     sync.RWMutex
+}
+
+// sshConn represents a single SSH connection through SSM.
+type sshConn struct {
+	id uint64
+
+	ssmClient *ssm.Client
+	adapter   *protocol.Adapter
+	sshClient *gossh.Client
+
+	activeChannels int64 // Number of active channels (approx via conn lifetime)
+	inflightDials  int64 // Number of in-flight Dial() calls
+
+	// Per-connection dial timeout tracking.
+	dialTimeoutCount        int64
+	lastDialTimeoutUnixNano int64
+}
+
+// Default pool size per upstream. Having multiple SSH connections prevents
+// channel contention when one connection is busy with large data transfers.
+const (
+	defaultPoolSize = 4
+
+	// maxPoolSize bounds how far we can scale out the pool under load.
+	// Larger values reduce head-of-line blocking at the cost of more SSM+SSH sessions.
+	// NOTE: Too many concurrent sessions can cause the remote side to close channels.
+	maxPoolSize = 12
+
+	// maxChannelsPerConn limits multiplexing on a single SSH connection.
+	// Keeping this >1 reduces SSM session churn for workloads like docker push (many parallel HTTP connections).
+	maxChannelsPerConn = 4
+
+	// scaleParallelism limits how many new SSM+SSH sessions we try to establish concurrently
+	// when scaling under load.
+	scaleParallelism = 2
+)
+
+type trackedConn struct {
+	net.Conn
+	sc   *sshConn
+	once sync.Once
+}
+
+func (c *trackedConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(func() {
+		atomic.AddInt64(&c.sc.activeChannels, -1)
+	})
+	return err
 }
 
 // Group represents a set of instances for a single upstream.
@@ -29,10 +89,18 @@ type Group struct {
 	instances []string
 	current   int // Current instance index for failover
 
-	ssmClient *ssm.Client
-	adapter   *protocol.Adapter
-	sshClient *gossh.Client
-	connMu    sync.Mutex
+	// Pool of SSH connections for parallelism.
+	conns    []*sshConn
+	connsMu  sync.RWMutex
+	nextConn uint64 // Round-robin counter
+
+	// Serialize pool growth calculations and bound concurrent SSM+SSH session creation.
+	scaleMu       sync.Mutex
+	scaleInFlight int
+
+	// Forced reconnect throttling.
+	lastForcedReconnectUnixNano int64
+	forcedReconnectInProgress   int32
 
 	// For connection maintenance
 	ctx    context.Context
@@ -94,51 +162,360 @@ func (p *Pool) Dial(ctx context.Context, upstreamName, network, addr string) (ne
 	return group.dial(ctx, network, addr)
 }
 
-// dial attempts to connect through the group's SSH client.
+const (
+	dialTimeoutWindow           = 30 * time.Second
+	dialTimeoutsBeforeReconnect = 3
+	forcedReconnectCooldown     = 15 * time.Second
+)
+
+// selectConn picks a connection from the pool.
+//
+// We prefer the least-loaded connection (by activeChannels, then inflightDials) to
+// reduce head-of-line blocking when one SSH connection is busy with large transfers.
+// Returns nil if pool is empty.
+func (g *Group) selectConn() *sshConn {
+	g.connsMu.RLock()
+	defer g.connsMu.RUnlock()
+
+	if len(g.conns) == 0 {
+		return nil
+	}
+
+	// Find the minimum load across the pool.
+	minActive := int64(1 << 62)
+	minInflight := int64(1 << 62)
+	candidates := make([]*sshConn, 0, len(g.conns))
+
+	for _, sc := range g.conns {
+		active := atomic.LoadInt64(&sc.activeChannels)
+		inflight := atomic.LoadInt64(&sc.inflightDials)
+
+		if active < minActive || (active == minActive && inflight < minInflight) {
+			minActive = active
+			minInflight = inflight
+			candidates = candidates[:0]
+			candidates = append(candidates, sc)
+			continue
+		}
+		if active == minActive && inflight == minInflight {
+			candidates = append(candidates, sc)
+		}
+	}
+
+	if len(candidates) == 0 {
+		// Should not happen, but be defensive.
+		idx := atomic.AddUint64(&g.nextConn, 1) % uint64(len(g.conns))
+		return g.conns[idx]
+	}
+
+	// Break ties with round-robin.
+	idx := atomic.AddUint64(&g.nextConn, 1) % uint64(len(candidates))
+	return candidates[idx]
+}
+
+// selectConnWithCapacity picks a connection from the pool that has capacity for a
+// new channel (active + inflight < maxChannelsPerConn). Returns nil if none are
+// available.
+func (g *Group) selectConnWithCapacity() *sshConn {
+	g.connsMu.RLock()
+	defer g.connsMu.RUnlock()
+
+	if len(g.conns) == 0 {
+		return nil
+	}
+
+	minActive := int64(1 << 62)
+	minInflight := int64(1 << 62)
+	candidates := make([]*sshConn, 0, len(g.conns))
+
+	for _, sc := range g.conns {
+		active := atomic.LoadInt64(&sc.activeChannels)
+		inflight := atomic.LoadInt64(&sc.inflightDials)
+		if active+inflight >= maxChannelsPerConn {
+			continue
+		}
+
+		if active < minActive || (active == minActive && inflight < minInflight) {
+			minActive = active
+			minInflight = inflight
+			candidates = candidates[:0]
+			candidates = append(candidates, sc)
+			continue
+		}
+		if active == minActive && inflight == minInflight {
+			candidates = append(candidates, sc)
+		}
+	}
+
+	if len(candidates) == 0 {
+		return nil
+	}
+
+	idx := atomic.AddUint64(&g.nextConn, 1) % uint64(len(candidates))
+	return candidates[idx]
+}
+
+// startScaleIfNeeded tries to grow the pool when all current connections are at
+// capacity. It returns true if it started any new connection attempts.
+func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
+	// Re-check under lock-free reads to avoid doing work if capacity is already
+	// available.
+	if g.selectConnWithCapacity() != nil {
+		return false
+	}
+
+	g.scaleMu.Lock()
+	defer g.scaleMu.Unlock()
+
+	g.connsMu.RLock()
+	poolSize := len(g.conns)
+	g.connsMu.RUnlock()
+
+	total := poolSize + g.scaleInFlight
+	if total >= maxPoolSize {
+		return false
+	}
+	if g.scaleInFlight >= scaleParallelism {
+		return false
+	}
+
+	// Add conservatively to avoid stampeding SSM/SSH and triggering remote channel closures.
+	remainingPool := maxPoolSize - total
+	remainingParallel := scaleParallelism - g.scaleInFlight
+	add := 1
+	if add > remainingPool {
+		add = remainingPool
+	}
+	if add > remainingParallel {
+		add = remainingParallel
+	}
+	if add <= 0 {
+		return false
+	}
+
+	g.scaleInFlight += add
+	instance := g.instances[g.current]
+
+	debugLog("upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
+		g.name, add, poolSize, g.scaleInFlight, connID, addr)
+
+	for i := 0; i < add; i++ {
+		go func() {
+			defer func() {
+				g.scaleMu.Lock()
+				g.scaleInFlight--
+				g.scaleMu.Unlock()
+			}()
+
+			baseCtx := g.ctx
+			if baseCtx == nil {
+				baseCtx = context.Background()
+			}
+			scaleCtx, cancel := context.WithTimeout(baseCtx, 60*time.Second)
+			defer cancel()
+
+			sc, err := g.connectSingle(scaleCtx, instance)
+			if err != nil {
+				log.Printf("[WARN] upstream %s: scale-up connection failed: %v", g.name, err)
+				return
+			}
+
+			g.connsMu.Lock()
+			g.conns = append(g.conns, sc)
+			current := len(g.conns)
+			g.connsMu.Unlock()
+
+			log.Printf("[INFO] upstream %s: scaled pool connection established (pool=%d) (sshConn=%d)", g.name, current, sc.id)
+		}()
+	}
+
+	return true
+}
+
+// dial attempts to connect through one of the group's SSH connections.
 // Uses goroutine + select to respect context timeout since SSH Dial doesn't accept context.
 func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	g.connMu.Lock()
-	client := g.sshClient
-	g.connMu.Unlock()
+	connID, _ := trace.ConnIDFromContext(ctx)
+	start := time.Now()
 
-	if client == nil {
+	waitLogged := false
+
+	var sc *sshConn
+	for {
+		sc = g.selectConnWithCapacity()
+		if sc != nil {
+			// Reserve capacity for this dial.
+			inflight := atomic.AddInt64(&sc.inflightDials, 1)
+			if atomic.LoadInt64(&sc.activeChannels)+inflight > maxChannelsPerConn {
+				atomic.AddInt64(&sc.inflightDials, -1)
+				continue
+			}
+			break
+		}
+
+		g.connsMu.RLock()
+		poolSize := len(g.conns)
+		g.connsMu.RUnlock()
+		if poolSize == 0 {
+			return nil, fmt.Errorf("upstream %s: not connected", g.name)
+		}
+
+		if !waitLogged {
+			waitLogged = true
+			debugLog("upstream %s: dial waiting for capacity conn=%d addr=%s (pool=%d maxPool=%d)",
+				g.name, connID, addr, poolSize, maxPoolSize)
+		}
+
+		_ = g.startScaleIfNeeded(connID, addr)
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("upstream %s: dial wait for capacity: %w", g.name, ctx.Err())
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	defer atomic.AddInt64(&sc.inflightDials, -1)
+
+	if sc == nil || sc.sshClient == nil {
 		return nil, fmt.Errorf("upstream %s: not connected", g.name)
 	}
+
+	g.connsMu.RLock()
+	poolSize := len(g.conns)
+	g.connsMu.RUnlock()
+
+	debugLog("upstream %s: dial start conn=%d sshConn=%d addr=%s active=%d inflight=%d pool=%d",
+		g.name, connID, sc.id, addr, atomic.LoadInt64(&sc.activeChannels), atomic.LoadInt64(&sc.inflightDials), poolSize)
 
 	type dialResult struct {
 		conn net.Conn
 		err  error
 	}
-	resultCh := make(chan dialResult, 1)
+	// Unbuffered channel so we can safely close results when ctx is already done.
+	resultCh := make(chan dialResult)
 
 	go func() {
-		conn, err := client.Dial(network, addr)
-		resultCh <- dialResult{conn, err}
+		conn, err := sc.sshClient.Dial(network, addr)
+		if err != nil {
+			select {
+			case resultCh <- dialResult{conn: nil, err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+
+		// If the caller is no longer waiting (ctx done), close to avoid leaking an SSH channel.
+		select {
+		case resultCh <- dialResult{conn: conn, err: nil}:
+			return
+		case <-ctx.Done():
+			_ = conn.Close()
+			return
+		}
 	}()
 
 	select {
 	case <-ctx.Done():
-		// Timeout or cancellation - connection will be orphaned but GCed
+		debugLog("upstream %s: dial timeout conn=%d sshConn=%d addr=%s dur=%s err=%v",
+			g.name, connID, sc.id, addr, time.Since(start), ctx.Err())
+
+		// Track repeated timeouts and evict only the problematic sshConn (instead of
+		// reconnecting the whole pool) to reduce blast radius on long-lived transfers.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			count := g.recordDialTimeout(sc)
+			if count >= dialTimeoutsBeforeReconnect {
+				g.maybeForceReconnect(sc, fmt.Sprintf("%d dial timeouts within %s (last target=%s)", count, dialTimeoutWindow, addr))
+			}
+		}
 		return nil, fmt.Errorf("upstream %s: dial timeout: %w", g.name, ctx.Err())
 
 	case result := <-resultCh:
 		if result.err != nil {
-			log.Printf("[WARN] upstream %s: dial failed, cleaning up for reconnect: %v", g.name, result.err)
-			g.connMu.Lock()
-			g.cleanup()
-			g.connMu.Unlock()
+			debugLog("upstream %s: dial failed conn=%d sshConn=%d addr=%s dur=%s err=%v",
+				g.name, connID, sc.id, addr, time.Since(start), result.err)
+			log.Printf("[WARN] upstream %s: dial failed: %v", g.name, result.err)
+			// Mark this specific connection as broken; maintain() will handle reconnect.
+			g.connsMu.Lock()
+			g.removeConn(sc)
+			g.connsMu.Unlock()
 			return nil, fmt.Errorf("upstream %s: dial failed: %w", g.name, result.err)
 		}
-		return result.conn, nil
+
+		atomic.AddInt64(&sc.activeChannels, 1)
+		debugLog("upstream %s: dial ok conn=%d sshConn=%d addr=%s dur=%s active=%d",
+			g.name, connID, sc.id, addr, time.Since(start), atomic.LoadInt64(&sc.activeChannels))
+
+		return &trackedConn{Conn: result.conn, sc: sc}, nil
 	}
 }
 
-// connect establishes SSM → SSH connection with failover.
+// removeConn removes a specific connection from the pool and closes it.
+// Caller must hold connsMu write lock.
+func (g *Group) removeConn(sc *sshConn) {
+	for i, c := range g.conns {
+		if c == sc {
+			g.conns = append(g.conns[:i], g.conns[i+1:]...)
+			if sc.sshClient != nil {
+				sc.sshClient.Close()
+			}
+			if sc.adapter != nil {
+				sc.adapter.Close()
+			}
+			return
+		}
+	}
+}
+
+func (g *Group) recordDialTimeout(sc *sshConn) int64 {
+	if sc == nil {
+		return 0
+	}
+
+	now := time.Now().UnixNano()
+	prev := atomic.SwapInt64(&sc.lastDialTimeoutUnixNano, now)
+
+	if prev == 0 || time.Duration(now-prev) > dialTimeoutWindow {
+		atomic.StoreInt64(&sc.dialTimeoutCount, 1)
+		return 1
+	}
+
+	return atomic.AddInt64(&sc.dialTimeoutCount, 1)
+}
+
+func (g *Group) maybeForceReconnect(sc *sshConn, reason string) {
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&g.lastForcedReconnectUnixNano)
+	if last != 0 && time.Duration(now-last) < forcedReconnectCooldown {
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&g.forcedReconnectInProgress, 0, 1) {
+		return
+	}
+
+	atomic.StoreInt64(&g.lastForcedReconnectUnixNano, now)
+
+	if sc == nil {
+		log.Printf("[WARN] upstream %s: requested reconnect but no connection was selected (%s)", g.name, reason)
+		atomic.StoreInt32(&g.forcedReconnectInProgress, 0)
+		return
+	}
+
+	log.Printf("[WARN] upstream %s: evicting pool connection (sshConn=%d) (%s)", g.name, sc.id, reason)
+
+	go func() {
+		defer atomic.StoreInt32(&g.forcedReconnectInProgress, 0)
+		g.connsMu.Lock()
+		g.removeConn(sc)
+		g.connsMu.Unlock()
+	}()
+}
+
+// connect establishes the SSH connection pool with failover.
 func (g *Group) connect(ctx context.Context) error {
 	for attempt := 0; attempt < len(g.instances); attempt++ {
 		instance := g.instances[g.current]
 
-		if err := g.connectToInstance(ctx, instance); err != nil {
+		if err := g.connectPool(ctx, instance); err != nil {
 			log.Printf("[WARN] upstream %s: instance %s failed: %v", g.name, instance, err)
 			g.current = (g.current + 1) % len(g.instances)
 			continue
@@ -150,110 +527,176 @@ func (g *Group) connect(ctx context.Context) error {
 	return fmt.Errorf("all instances failed")
 }
 
-// connectToInstance establishes connection to a specific instance.
-func (g *Group) connectToInstance(ctx context.Context, instanceID string) error {
-	var err error
+// connectPool establishes multiple SSH connections to a single instance.
+func (g *Group) connectPool(ctx context.Context, instanceID string) error {
+	type connResult struct {
+		sc  *sshConn
+		err error
+		idx int
+	}
 
+	results := make(chan connResult, defaultPoolSize)
+	for i := 0; i < defaultPoolSize; i++ {
+		i := i
+		go func() {
+			connCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			defer cancel()
+			sc, err := g.connectSingle(connCtx, instanceID)
+			results <- connResult{sc: sc, err: err, idx: i}
+		}()
+	}
+
+	var newConns []*sshConn
+	var firstErr error
+	for i := 0; i < defaultPoolSize; i++ {
+		res := <-results
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			log.Printf("[WARN] upstream %s: pool connection %d/%d failed: %v", g.name, res.idx+1, defaultPoolSize, res.err)
+			continue
+		}
+		newConns = append(newConns, res.sc)
+		log.Printf("[INFO] upstream %s: pool connection %d/%d established (sshConn=%d)", g.name, res.idx+1, defaultPoolSize, res.sc.id)
+	}
+
+	if len(newConns) == 0 {
+		return fmt.Errorf("failed to establish any connections: %w", firstErr)
+	}
+
+	g.connsMu.Lock()
+	g.conns = newConns
+	g.connsMu.Unlock()
+
+	log.Printf("[INFO] upstream %s: pool ready with %d connections", g.name, len(newConns))
+	return nil
+}
+
+// connectSingle establishes a single SSM → SSH connection.
+func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn, error) {
 	// Create SSM client
-	g.ssmClient, err = ssm.NewClient(ctx, ssm.ClientConfig{
+	ssmClient, err := ssm.NewClient(ctx, ssm.ClientConfig{
 		Profile:   g.awsCfg.Profile,
 		Region:    g.awsCfg.Region,
 		AccessKey: g.awsCfg.AccessKey,
 		SecretKey: g.awsCfg.SecretKey,
 	})
 	if err != nil {
-		return fmt.Errorf("create SSM client: %w", err)
+		return nil, fmt.Errorf("create SSM client: %w", err)
 	}
 
 	log.Printf("[INFO] upstream %s: starting SSM session to %s (region=%s)...",
-		g.name, instanceID, g.ssmClient.Region())
+		g.name, instanceID, ssmClient.Region())
 
 	// Start SSM session
-	session, err := g.ssmClient.StartSession(ctx, instanceID)
+	session, err := ssmClient.StartSession(ctx, instanceID)
 	if err != nil {
-		return fmt.Errorf("start session: %w", err)
+		return nil, fmt.Errorf("start session: %w", err)
 	}
 
 	// Connect via WebSocket
-	g.adapter, err = protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
+	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
 	if err != nil {
-		return fmt.Errorf("websocket connect: %w", err)
+		return nil, fmt.Errorf("websocket connect: %w", err)
 	}
 
 	// Wait for SSM handshake
-	if err := g.adapter.WaitForHandshake(ctx); err != nil {
-		g.adapter.Close()
-		g.adapter = nil
-		return fmt.Errorf("SSM handshake: %w", err)
+	if err := adapter.WaitForHandshake(ctx); err != nil {
+		adapter.Close()
+		return nil, fmt.Errorf("SSM handshake: %w", err)
 	}
 
 	// Establish SSH connection
-	g.sshClient, err = internalssh.Connect(g.adapter, g.sshConfig)
+	sshClient, err := internalssh.Connect(adapter, g.sshConfig)
 	if err != nil {
-		g.adapter.Close()
-		g.adapter = nil
-		return fmt.Errorf("SSH connect: %w", err)
+		adapter.Close()
+		return nil, fmt.Errorf("SSH connect: %w", err)
 	}
 
-	return nil
+	return &sshConn{
+		id:        atomic.AddUint64(&nextSSHConnID, 1),
+		ssmClient: ssmClient,
+		adapter:   adapter,
+		sshClient: sshClient,
+	}, nil
 }
 
-// maintain monitors connection and reconnects on failure.
+// maintain monitors connections and replenishes the pool on failure.
 func (g *Group) maintain() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
 	for {
-		// Get adapter Done channel while holding lock briefly
-		g.connMu.Lock()
-		adapter := g.adapter
-		g.connMu.Unlock()
-
-		var adapterDone <-chan struct{}
-		if adapter != nil {
-			adapterDone = adapter.Done()
-		}
-
 		select {
 		case <-g.ctx.Done():
 			return
+		case <-ticker.C:
+		}
 
-		case <-adapterDone:
-			// Adapter closed (channel_closed or connection lost)
-			g.connMu.Lock()
-			log.Printf("[INFO] upstream %s: adapter closed, reconnecting...", g.name)
-			g.cleanup()
-			if err := g.connect(g.ctx); err != nil {
-				log.Printf("[ERROR] upstream %s: reconnection failed: %v", g.name, err)
-			} else {
-				log.Printf("[INFO] upstream %s: reconnected via instance %s", g.name, g.instances[g.current])
-			}
-			g.connMu.Unlock()
-
-		case <-time.After(5 * time.Second):
-			// Periodic check for nil references (from dial failures)
-			g.connMu.Lock()
-			if g.sshClient == nil || g.adapter == nil {
-				log.Printf("[INFO] upstream %s: connection lost, reconnecting...", g.name)
-				g.cleanup()
-				if err := g.connect(g.ctx); err != nil {
-					log.Printf("[ERROR] upstream %s: reconnection failed: %v", g.name, err)
-				} else {
-					log.Printf("[INFO] upstream %s: reconnected via instance %s", g.name, g.instances[g.current])
+		// Check pool health: remove dead connections and replenish.
+		g.connsMu.Lock()
+		var alive []*sshConn
+		for _, sc := range g.conns {
+			if sc.adapter != nil {
+				select {
+				case <-sc.adapter.Done():
+					// Connection dead, close and skip.
+					log.Printf("[INFO] upstream %s: pool connection closed, removing (sshConn=%d)", g.name, sc.id)
+					if sc.sshClient != nil {
+						sc.sshClient.Close()
+					}
+					sc.adapter.Close()
+				default:
+					alive = append(alive, sc)
 				}
 			}
-			g.connMu.Unlock()
+		}
+		g.conns = alive
+		currentCount := len(alive)
+		g.connsMu.Unlock()
+
+		// Replenish if pool is below target size.
+		if currentCount < defaultPoolSize {
+			needed := defaultPoolSize - currentCount
+			log.Printf("[INFO] upstream %s: pool has %d/%d connections, replenishing %d",
+				g.name, currentCount, defaultPoolSize, needed)
+
+			instance := g.instances[g.current]
+			for i := 0; i < needed; i++ {
+				sc, err := g.connectSingle(g.ctx, instance)
+				if err != nil {
+					log.Printf("[WARN] upstream %s: failed to replenish connection: %v", g.name, err)
+					// Try next instance on repeated failures.
+					if i > 0 {
+						g.current = (g.current + 1) % len(g.instances)
+						instance = g.instances[g.current]
+					}
+					continue
+				}
+
+				g.connsMu.Lock()
+				g.conns = append(g.conns, sc)
+				current := len(g.conns)
+				g.connsMu.Unlock()
+				log.Printf("[INFO] upstream %s: replenished pool connection (%d/%d) (sshConn=%d)",
+					g.name, current, defaultPoolSize, sc.id)
+			}
 		}
 	}
 }
 
-// cleanup closes all connections in the group.
+// cleanup closes all connections in the pool.
 func (g *Group) cleanup() {
-	if g.sshClient != nil {
-		g.sshClient.Close()
-		g.sshClient = nil
+	for _, sc := range g.conns {
+		if sc.sshClient != nil {
+			sc.sshClient.Close()
+		}
+		if sc.adapter != nil {
+			sc.adapter.Close()
+		}
 	}
-	if g.adapter != nil {
-		g.adapter.Close()
-		g.adapter = nil
-	}
+	g.conns = nil
 }
 
 // Close closes all upstream connections.
@@ -265,8 +708,8 @@ func (p *Pool) Close() {
 		if g.cancel != nil {
 			g.cancel()
 		}
-		g.connMu.Lock()
+		g.connsMu.Lock()
 		g.cleanup()
-		g.connMu.Unlock()
+		g.connsMu.Unlock()
 	}
 }
