@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,7 @@ type ExponentialRetryer struct {
 	MaxAttempts int
 
 	rng *rand.Rand
+	mu  sync.Mutex
 }
 
 // DefaultRetryer returns a retryer with sensible defaults matching AWS behavior.
@@ -74,9 +76,21 @@ func (r *ExponentialRetryer) RunContext(ctx context.Context, fn func() error) er
 	}
 }
 
-// nextDelay calculates the next delay with jitter.
+// NextDelay calculates the next delay with jitter.
 // Formula: min(MaxDelay, InitialDelay * Multiplier^attempt) + jitter
+func (r *ExponentialRetryer) NextDelay(attempt int) time.Duration {
+	return r.nextDelay(attempt)
+}
+
+// nextDelay calculates the next delay with jitter (thread-safe).
 func (r *ExponentialRetryer) nextDelay(attempt int) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calculateDelay(attempt)
+}
+
+// calculateDelay assumes the caller holds the retryer mutex.
+func (r *ExponentialRetryer) calculateDelay(attempt int) time.Duration {
 	delay := float64(r.InitialDelay) * math.Pow(r.Multiplier, float64(attempt-1))
 
 	if delay > float64(r.MaxDelay) {

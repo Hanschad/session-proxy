@@ -13,6 +13,7 @@ import (
 	"github.com/hanschad/session-proxy/internal/aws/ssm"
 	"github.com/hanschad/session-proxy/internal/config"
 	"github.com/hanschad/session-proxy/internal/protocol"
+	"github.com/hanschad/session-proxy/internal/retry"
 	internalssh "github.com/hanschad/session-proxy/internal/ssh"
 	"github.com/hanschad/session-proxy/internal/trace"
 	gossh "golang.org/x/crypto/ssh"
@@ -65,6 +66,12 @@ const (
 	// scaleParallelism limits how many new SSM+SSH sessions we try to establish concurrently
 	// when scaling under load.
 	scaleParallelism = 2
+
+	// replenishParallelism limits concurrent replenish attempts when pool is below target size.
+	replenishParallelism = 2
+
+	// replenishTimeout bounds a single replenish attempt to avoid blocking maintenance.
+	replenishTimeout = 60 * time.Second
 )
 
 type trackedConn struct {
@@ -83,11 +90,12 @@ func (c *trackedConn) Close() error {
 
 // Group represents a set of instances for a single upstream.
 type Group struct {
-	name      string
-	sshConfig internalssh.Config
-	awsCfg    config.AWSConfig
-	instances []string
-	current   int // Current instance index for failover
+	name       string
+	sshConfig  internalssh.Config
+	awsCfg     config.AWSConfig
+	instances  []string
+	current    int // Current instance index for failover
+	instanceMu sync.Mutex
 
 	// Pool of SSH connections for parallelism.
 	conns    []*sshConn
@@ -101,6 +109,13 @@ type Group struct {
 	// Forced reconnect throttling.
 	lastForcedReconnectUnixNano int64
 	forcedReconnectInProgress   int32
+	// Replenish backoff and concurrency control.
+	replenishMu          sync.Mutex
+	replenishInFlight    int
+	replenishFailures    int
+	replenishNextAttempt time.Time
+	replenishRetryer     *retry.ExponentialRetryer
+	replenishAttemptID   uint64
 
 	// For connection maintenance
 	ctx    context.Context
@@ -114,14 +129,17 @@ func NewPool(cfg *config.Config) *Pool {
 	}
 
 	for name, up := range cfg.Upstreams {
+		retryer := retry.DefaultRetryer()
+		retryer.MaxAttempts = 0
 		p.groups[name] = &Group{
 			name: name,
 			sshConfig: internalssh.Config{
 				User:           up.SSH.User,
 				PrivateKeyPath: up.SSH.Key,
 			},
-			awsCfg:    up.AWS,
-			instances: up.Instances,
+			awsCfg:           up.AWS,
+			instances:        up.Instances,
+			replenishRetryer: retryer,
 		}
 	}
 
@@ -139,7 +157,7 @@ func (p *Pool) Connect(ctx context.Context) error {
 		if err := group.connect(ctx); err != nil {
 			return fmt.Errorf("upstream %q: %w", name, err)
 		}
-		log.Printf("[INFO] Upstream %q connected via instance %s", name, group.instances[group.current])
+		log.Printf("[INFO] Upstream %q connected via instance %s", name, group.currentInstance())
 
 		// Start connection maintenance goroutine
 		group.ctx, group.cancel = context.WithCancel(ctx)
@@ -211,6 +229,19 @@ func (g *Group) selectConn() *sshConn {
 	// Break ties with round-robin.
 	idx := atomic.AddUint64(&g.nextConn, 1) % uint64(len(candidates))
 	return candidates[idx]
+}
+
+func (g *Group) currentInstance() string {
+	g.instanceMu.Lock()
+	defer g.instanceMu.Unlock()
+	return g.instances[g.current]
+}
+
+func (g *Group) advanceInstance() string {
+	g.instanceMu.Lock()
+	defer g.instanceMu.Unlock()
+	g.current = (g.current + 1) % len(g.instances)
+	return g.instances[g.current]
 }
 
 // selectConnWithCapacity picks a connection from the pool that has capacity for a
@@ -294,7 +325,7 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 	}
 
 	g.scaleInFlight += add
-	instance := g.instances[g.current]
+	instance := g.currentInstance()
 
 	debugLog("upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
 		g.name, add, poolSize, g.scaleInFlight, connID, addr)
@@ -513,11 +544,11 @@ func (g *Group) maybeForceReconnect(sc *sshConn, reason string) {
 // connect establishes the SSH connection pool with failover.
 func (g *Group) connect(ctx context.Context) error {
 	for attempt := 0; attempt < len(g.instances); attempt++ {
-		instance := g.instances[g.current]
+		instance := g.currentInstance()
 
 		if err := g.connectPool(ctx, instance); err != nil {
 			log.Printf("[WARN] upstream %s: instance %s failed: %v", g.name, instance, err)
-			g.current = (g.current + 1) % len(g.instances)
+			g.advanceInstance()
 			continue
 		}
 
@@ -576,6 +607,7 @@ func (g *Group) connectPool(ctx context.Context, instanceID string) error {
 // connectSingle establishes a single SSM → SSH connection.
 func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn, error) {
 	// Create SSM client
+	stepStart := time.Now()
 	ssmClient, err := ssm.NewClient(ctx, ssm.ClientConfig{
 		Profile:   g.awsCfg.Profile,
 		Region:    g.awsCfg.Region,
@@ -585,34 +617,43 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 	if err != nil {
 		return nil, fmt.Errorf("create SSM client: %w", err)
 	}
+	debugLog("upstream %s: connectSingle step=ssm_client ok dur=%s", g.name, time.Since(stepStart))
 
 	log.Printf("[INFO] upstream %s: starting SSM session to %s (region=%s)...",
 		g.name, instanceID, ssmClient.Region())
 
 	// Start SSM session
+	stepStart = time.Now()
 	session, err := ssmClient.StartSession(ctx, instanceID)
 	if err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}
+	debugLog("upstream %s: connectSingle step=start_session ok dur=%s", g.name, time.Since(stepStart))
 
 	// Connect via WebSocket
+	stepStart = time.Now()
 	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
 	if err != nil {
 		return nil, fmt.Errorf("websocket connect: %w", err)
 	}
+	debugLog("upstream %s: connectSingle step=websocket_connect ok dur=%s", g.name, time.Since(stepStart))
 
 	// Wait for SSM handshake
+	stepStart = time.Now()
 	if err := adapter.WaitForHandshake(ctx); err != nil {
 		adapter.Close()
 		return nil, fmt.Errorf("SSM handshake: %w", err)
 	}
+	debugLog("upstream %s: connectSingle step=ssm_handshake ok dur=%s", g.name, time.Since(stepStart))
 
 	// Establish SSH connection
+	stepStart = time.Now()
 	sshClient, err := internalssh.Connect(adapter, g.sshConfig)
 	if err != nil {
 		adapter.Close()
 		return nil, fmt.Errorf("SSH connect: %w", err)
 	}
+	debugLog("upstream %s: connectSingle step=ssh_connect ok dur=%s", g.name, time.Since(stepStart))
 
 	return &sshConn{
 		id:        atomic.AddUint64(&nextSSHConnID, 1),
@@ -620,6 +661,101 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 		adapter:   adapter,
 		sshClient: sshClient,
 	}, nil
+}
+
+func (g *Group) reserveReplenish(currentCount int) (int, time.Duration) {
+	g.replenishMu.Lock()
+	defer g.replenishMu.Unlock()
+
+	if g.replenishRetryer == nil {
+		g.replenishRetryer = retry.DefaultRetryer()
+		g.replenishRetryer.MaxAttempts = 0
+	}
+
+	now := time.Now()
+	if !g.replenishNextAttempt.IsZero() && now.Before(g.replenishNextAttempt) {
+		return 0, time.Until(g.replenishNextAttempt)
+	}
+
+	needed := defaultPoolSize - currentCount
+	if needed <= 0 {
+		return 0, 0
+	}
+
+	available := replenishParallelism - g.replenishInFlight
+	if available <= 0 {
+		return 0, 0
+	}
+
+	if needed > available {
+		needed = available
+	}
+
+	g.replenishInFlight += needed
+	return needed, 0
+}
+
+func (g *Group) finishReplenish() {
+	g.replenishMu.Lock()
+	if g.replenishInFlight > 0 {
+		g.replenishInFlight--
+	}
+	g.replenishMu.Unlock()
+}
+
+func (g *Group) recordReplenishSuccess() {
+	g.replenishMu.Lock()
+	g.replenishFailures = 0
+	g.replenishNextAttempt = time.Time{}
+	g.replenishMu.Unlock()
+}
+
+func (g *Group) recordReplenishFailure() (time.Duration, int) {
+	g.replenishMu.Lock()
+	defer g.replenishMu.Unlock()
+
+	if g.replenishRetryer == nil {
+		g.replenishRetryer = retry.DefaultRetryer()
+		g.replenishRetryer.MaxAttempts = 0
+	}
+
+	g.replenishFailures++
+	delay := g.replenishRetryer.NextDelay(g.replenishFailures)
+	g.replenishNextAttempt = time.Now().Add(delay)
+	return delay, g.replenishFailures
+}
+
+func (g *Group) replenishOnce(instance string, attemptID uint64) {
+	defer g.finishReplenish()
+
+	baseCtx := g.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(baseCtx, replenishTimeout)
+	defer cancel()
+
+	start := time.Now()
+	debugLog("upstream %s: replenish attempt start (attempt=%d instance=%s timeout=%s)", g.name, attemptID, instance, replenishTimeout)
+
+	sc, err := g.connectSingle(ctx, instance)
+	if err != nil {
+		delay, failures := g.recordReplenishFailure()
+		log.Printf("[WARN] upstream %s: replenish attempt failed (attempt=%d) after %s: %v (backoff=%s failures=%d)", g.name, attemptID, time.Since(start), err, delay, failures)
+		if len(g.instances) > 1 {
+			g.advanceInstance()
+		}
+		return
+	}
+
+	g.connsMu.Lock()
+	g.conns = append(g.conns, sc)
+	current := len(g.conns)
+	g.connsMu.Unlock()
+
+	g.recordReplenishSuccess()
+	log.Printf("[INFO] upstream %s: replenished pool connection (%d/%d) (sshConn=%d) (attempt=%d)", g.name, current, defaultPoolSize, sc.id, attemptID)
 }
 
 // maintain monitors connections and replenishes the pool on failure.
@@ -658,29 +794,22 @@ func (g *Group) maintain() {
 
 		// Replenish if pool is below target size.
 		if currentCount < defaultPoolSize {
-			needed := defaultPoolSize - currentCount
+			needed, wait := g.reserveReplenish(currentCount)
+			if wait > 0 {
+				debugLog("upstream %s: replenish backoff active, next attempt in %s", g.name, wait)
+				continue
+			}
+			if needed == 0 {
+				continue
+			}
+
 			log.Printf("[INFO] upstream %s: pool has %d/%d connections, replenishing %d",
 				g.name, currentCount, defaultPoolSize, needed)
 
-			instance := g.instances[g.current]
 			for i := 0; i < needed; i++ {
-				sc, err := g.connectSingle(g.ctx, instance)
-				if err != nil {
-					log.Printf("[WARN] upstream %s: failed to replenish connection: %v", g.name, err)
-					// Try next instance on repeated failures.
-					if i > 0 {
-						g.current = (g.current + 1) % len(g.instances)
-						instance = g.instances[g.current]
-					}
-					continue
-				}
-
-				g.connsMu.Lock()
-				g.conns = append(g.conns, sc)
-				current := len(g.conns)
-				g.connsMu.Unlock()
-				log.Printf("[INFO] upstream %s: replenished pool connection (%d/%d) (sshConn=%d)",
-					g.name, current, defaultPoolSize, sc.id)
+				attemptID := atomic.AddUint64(&g.replenishAttemptID, 1)
+				instance := g.currentInstance()
+				go g.replenishOnce(instance, attemptID)
 			}
 		}
 	}
