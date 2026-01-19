@@ -118,8 +118,14 @@ type Group struct {
 	replenishAttemptID   uint64
 
 	// For connection maintenance
-	ctx    context.Context
-	cancel context.CancelFunc
+	ctx                     context.Context
+	cancel                  context.CancelFunc
+	lastMaintainTime        time.Time     // Used to detect system sleep/wake
+	sleepDetectionThreshold time.Duration // Configurable threshold for sleep detection
+
+	// Per-round instance rotation control: ensures we only rotate once per replenish round
+	// even when multiple concurrent attempts fail.
+	replenishRoundAdvanced int32 // atomic: 1 if already rotated this round, 0 otherwise
 }
 
 // NewPool creates a new upstream pool from configuration.
@@ -137,9 +143,10 @@ func NewPool(cfg *config.Config) *Pool {
 				User:           up.SSH.User,
 				PrivateKeyPath: up.SSH.Key,
 			},
-			awsCfg:           up.AWS,
-			instances:        up.Instances,
-			replenishRetryer: retryer,
+			awsCfg:                  up.AWS,
+			instances:               up.Instances,
+			replenishRetryer:        retryer,
+			sleepDetectionThreshold: cfg.SleepDetectionThreshold,
 		}
 	}
 
@@ -725,6 +732,17 @@ func (g *Group) recordReplenishFailure() (time.Duration, int) {
 	return delay, g.replenishFailures
 }
 
+// resetReplenishBackoff clears the backoff state to allow immediate retry.
+// Used after detecting system sleep/wake to recover quickly.
+func (g *Group) resetReplenishBackoff() {
+	g.replenishMu.Lock()
+	defer g.replenishMu.Unlock()
+
+	g.replenishFailures = 0
+	g.replenishNextAttempt = time.Time{}
+	g.replenishInFlight = 0
+}
+
 func (g *Group) replenishOnce(instance string, attemptID uint64) {
 	defer g.finishReplenish()
 
@@ -743,8 +761,15 @@ func (g *Group) replenishOnce(instance string, attemptID uint64) {
 	if err != nil {
 		delay, failures := g.recordReplenishFailure()
 		log.Printf("[WARN] upstream %s: replenish attempt failed (attempt=%d) after %s: %v (backoff=%s failures=%d)", g.name, attemptID, time.Since(start), err, delay, failures)
+
+		// Only rotate instance once per replenish round to avoid pointer wraparound
+		// when multiple concurrent attempts fail (e.g., 2 failures with 2 instances
+		// would rotate back to the original instance).
 		if len(g.instances) > 1 {
-			g.advanceInstance()
+			if atomic.CompareAndSwapInt32(&g.replenishRoundAdvanced, 0, 1) {
+				next := g.advanceInstance()
+				debugLog("upstream %s: rotated to next instance %s after failure", g.name, next)
+			}
 		}
 		return
 	}
@@ -763,12 +788,40 @@ func (g *Group) maintain() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
+	g.lastMaintainTime = time.Now()
+
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
 		case <-ticker.C:
 		}
+
+		now := time.Now()
+
+		// Detect system sleep/wake: if tick interval is much larger than expected,
+		// the system was likely asleep. Reset backoff and clear stale connections.
+		if !g.lastMaintainTime.IsZero() && g.sleepDetectionThreshold > 0 {
+			elapsed := now.Sub(g.lastMaintainTime)
+			if elapsed > g.sleepDetectionThreshold {
+				log.Printf("[INFO] upstream %s: detected system wake after %s, resetting backoff and clearing stale connections",
+					g.name, elapsed)
+				g.resetReplenishBackoff()
+				// Clear all connections since they are likely stale after sleep
+				g.connsMu.Lock()
+				for _, sc := range g.conns {
+					if sc.sshClient != nil {
+						sc.sshClient.Close()
+					}
+					if sc.adapter != nil {
+						sc.adapter.Close()
+					}
+				}
+				g.conns = nil
+				g.connsMu.Unlock()
+			}
+		}
+		g.lastMaintainTime = now
 
 		// Check pool health: remove dead connections and replenish.
 		g.connsMu.Lock()
@@ -806,9 +859,15 @@ func (g *Group) maintain() {
 			log.Printf("[INFO] upstream %s: pool has %d/%d connections, replenishing %d",
 				g.name, currentCount, defaultPoolSize, needed)
 
+			// Reset the per-round rotation flag: only one failed attempt in this round
+			// should trigger instance rotation to avoid pointer wraparound.
+			atomic.StoreInt32(&g.replenishRoundAdvanced, 0)
+
+			// Capture instance once per round so all concurrent attempts use the same target.
+			instance := g.currentInstance()
+
 			for i := 0; i < needed; i++ {
 				attemptID := atomic.AddUint64(&g.replenishAttemptID, 1)
-				instance := g.currentInstance()
 				go g.replenishOnce(instance, attemptID)
 			}
 		}

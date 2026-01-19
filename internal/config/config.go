@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -15,6 +16,11 @@ type Config struct {
 	Upstreams map[string]*Upstream `mapstructure:"upstreams"`
 	Routes    []Route              `mapstructure:"routes"`
 	Default   string               `mapstructure:"default"`
+
+	// SleepDetectionThreshold is the duration beyond which we consider the system
+	// to have been asleep (e.g., laptop lid closed). When detected, connections
+	// are reset and backoff is cleared for quick recovery. Default: 1 minute.
+	SleepDetectionThreshold time.Duration `mapstructure:"sleep_detection_threshold"`
 }
 
 // AuthConfig holds optional SOCKS5 authentication (per listen port).
@@ -145,6 +151,10 @@ func (c *Config) validate() error {
 
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:28881"
+	}
+
+	if c.SleepDetectionThreshold <= 0 {
+		c.SleepDetectionThreshold = 1 * time.Minute
 	}
 
 	return nil
