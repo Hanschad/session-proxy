@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/user"
+	"strings"
 	"syscall"
 	"time"
 
@@ -11,6 +13,15 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
 )
+
+func expandPath(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		if u, err := user.Current(); err == nil {
+			return u.HomeDir + path[1:]
+		}
+	}
+	return path
+}
 
 type Config struct {
 	User           string
@@ -30,7 +41,7 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 
 	// 2. Try Private Key
 	if cfg.PrivateKeyPath != "" {
-		key, err := os.ReadFile(cfg.PrivateKeyPath)
+		key, err := os.ReadFile(expandPath(cfg.PrivateKeyPath))
 		if err != nil {
 			// Don't error out, just skip if reading fails? Or maybe error?
 			// Let's print a warning but continue if agent worked?
