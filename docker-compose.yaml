@@ -1,0 +1,16 @@
+services:
+  session-proxy:
+    image: ghcr.io/hanschad/session-proxy:latest
+    # Or build locally: build: .
+    container_name: session-proxy
+    restart: unless-stopped
+    ports:
+      - "28881:28881"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.aws:/root/.aws:ro
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+    # For debug mode, uncomment:
+    # command: ["--config", "/config/config.yaml", "--debug"]

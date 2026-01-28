@@ -95,6 +95,27 @@ ssh -o ProxyCommand="nc -X 5 -x 127.0.0.1:28881 %h %p" user@internal-host
 └─────────────────────────────────────────────────────────────┘
 ```
 
+## Docker
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/hanschad/session-proxy:latest
+
+# Run with config
+docker run -d \
+  -p 28881:28881 \
+  -v $(pwd)/config.yaml:/config/config.yaml:ro \
+  -v ~/.ssh:/root/.ssh:ro \
+  -v ~/.aws:/root/.aws:ro \
+  ghcr.io/hanschad/session-proxy:latest
+
+# Or use docker compose
+docker compose up -d
+
+# View logs
+docker compose logs -f
+```
+
 ## Development
 
 ```bash

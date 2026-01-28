@@ -1,0 +1,14 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates
+
+COPY session-proxy /usr/local/bin/session-proxy
+
+VOLUME ["/config"]
+VOLUME ["/root/.ssh"]
+VOLUME ["/root/.aws"]
+
+EXPOSE 28881
+
+ENTRYPOINT ["session-proxy"]
+CMD ["--config", "/config/config.yaml"]

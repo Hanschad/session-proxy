@@ -62,3 +62,39 @@ changelog:
     exclude:
       - '^docs:'
       - '^test:'
+
+dockers:
+  - image_templates:
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-amd64"
+    use: buildx
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+  - image_templates:
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-arm64"
+    use: buildx
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile.goreleaser
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.title={{ .ProjectName }}"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.source={{ .GitURL }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/hanschad/session-proxy:{{ .Tag }}"
+    image_templates:
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-amd64"
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-arm64"
+
+  - name_template: "ghcr.io/hanschad/session-proxy:latest"
+    image_templates:
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-amd64"
+      - "ghcr.io/hanschad/session-proxy:{{ .Tag }}-arm64"
