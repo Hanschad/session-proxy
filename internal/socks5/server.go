@@ -2,12 +2,14 @@ package socks5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hanschad/session-proxy/internal/trace"
@@ -348,13 +350,15 @@ func (s *Server) sendReplyError(conn net.Conn, err error) {
 		}
 	}
 
-	if opErr, ok := err.(*net.OpError); ok {
-		switch opErr.Err.Error() {
-		case "connection refused":
+	// Use syscall errors for reliable cross-platform matching
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		switch syscallErr {
+		case syscall.ECONNREFUSED:
 			rep = RepConnectionRefused
-		case "network is unreachable":
+		case syscall.ENETUNREACH:
 			rep = RepNetworkUnreachable
-		case "no route to host":
+		case syscall.EHOSTUNREACH:
 			rep = RepHostUnreachable
 		}
 	}

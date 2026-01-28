@@ -1,6 +1,7 @@
 package router
 
 import (
+	"fmt"
 	"net"
 	"path/filepath"
 	"strings"
@@ -33,29 +34,38 @@ type Config struct {
 }
 
 // New creates a new Router from configuration.
-func New(cfg Config) *Router {
-	r := &Router{defaultName: cfg.Default}
-	r.rules = parseRules(cfg.Routes)
-	return r
+func New(cfg Config) (*Router, error) {
+	rules, err := parseRules(cfg.Routes)
+	if err != nil {
+		return nil, err
+	}
+	return &Router{defaultName: cfg.Default, rules: rules}, nil
 }
 
 // Update replaces the router rules with new configuration (hot reload).
-func (r *Router) Update(cfg Config) {
-	newRules := parseRules(cfg.Routes)
+func (r *Router) Update(cfg Config) error {
+	newRules, err := parseRules(cfg.Routes)
+	if err != nil {
+		return err
+	}
 
 	r.mu.Lock()
 	r.rules = newRules
 	r.defaultName = cfg.Default
 	r.mu.Unlock()
+	return nil
 }
 
-func parseRules(routes []struct{ Match, Upstream string }) []rule {
+func parseRules(routes []struct{ Match, Upstream string }) ([]rule, error) {
 	var rules []rule
 	for _, route := range routes {
 		rl := rule{upstream: route.Upstream}
 
-		_, cidr, err := net.ParseCIDR(route.Match)
-		if err == nil {
+		if strings.Contains(route.Match, "/") {
+			_, cidr, err := net.ParseCIDR(route.Match)
+			if err != nil {
+				return nil, fmt.Errorf("invalid CIDR %q: %w", route.Match, err)
+			}
 			rl.cidr = cidr
 		} else {
 			rl.domain = strings.ToLower(route.Match)
@@ -63,7 +73,7 @@ func parseRules(routes []struct{ Match, Upstream string }) []rule {
 
 		rules = append(rules, rl)
 	}
-	return rules
+	return rules, nil
 }
 
 // Match returns the upstream name for the given address.

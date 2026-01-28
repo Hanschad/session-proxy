@@ -75,7 +75,7 @@ func TestNewRoutingServerWithAuth(t *testing.T) {
 		},
 	}
 
-	r := router.New(router.Config{Default: "default"})
+	r, _ := router.New(router.Config{Default: "default"})
 
 	// We can't use a real pool, but we can test that NewRoutingServer handles auth config
 	// The server won't be fully functional without a real pool, but we verify the struct setup
@@ -101,7 +101,7 @@ func TestNewRoutingServerWithoutAuth(t *testing.T) {
 		},
 	}
 
-	r := router.New(router.Config{Default: "default"})
+	r, _ := router.New(router.Config{Default: "default"})
 	s, err := NewRoutingServer(cfg, r, nil)
 	if err != nil {
 		t.Fatalf("NewRoutingServer() error = %v", err)

@@ -47,6 +47,45 @@ type sshConn struct {
 	// Per-connection dial timeout tracking.
 	dialTimeoutCount        int64
 	lastDialTimeoutUnixNano int64
+
+	draining int32 // atomic: 1 = draining (no new channels), 0 = normal
+}
+
+func (sc *sshConn) markDraining() {
+	atomic.StoreInt32(&sc.draining, 1)
+}
+
+func (sc *sshConn) isDraining() bool {
+	return atomic.LoadInt32(&sc.draining) == 1
+}
+
+func (sc *sshConn) isIdle() bool {
+	return atomic.LoadInt64(&sc.activeChannels) == 0 && atomic.LoadInt64(&sc.inflightDials) == 0
+}
+
+func (sc *sshConn) close() {
+	if sc.sshClient != nil {
+		sc.sshClient.Close()
+	}
+	if sc.adapter != nil {
+		sc.adapter.Close()
+	}
+}
+
+// closeDrainingConns waits for each connection to become idle (or timeout) and closes it.
+func (g *Group) closeDrainingConns(conns []*sshConn, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for _, sc := range conns {
+		for time.Now().Before(deadline) {
+			if sc.isIdle() {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		log.Printf("[INFO] upstream %s: closing draining connection (sshConn=%d, idle=%v)",
+			g.name, sc.id, sc.isIdle())
+		sc.close()
+	}
 }
 
 // Default pool size per upstream. Having multiple SSH connections prevents
@@ -137,6 +176,8 @@ func NewPool(cfg *config.Config) *Pool {
 	for name, up := range cfg.Upstreams {
 		retryer := retry.DefaultRetryer()
 		retryer.MaxAttempts = 0
+		log.Printf("[DEBUG] NewPool: upstream=%q ssh.user=%q ssh.key=%q instances=%v",
+			name, up.SSH.User, up.SSH.Key, up.Instances)
 		p.groups[name] = &Group{
 			name: name,
 			sshConfig: internalssh.Config{
@@ -267,6 +308,9 @@ func (g *Group) selectConnWithCapacity() *sshConn {
 	candidates := make([]*sshConn, 0, len(g.conns))
 
 	for _, sc := range g.conns {
+		if sc.isDraining() {
+			continue
+		}
 		active := atomic.LoadInt64(&sc.activeChannels)
 		inflight := atomic.LoadInt64(&sc.inflightDials)
 		if active+inflight >= maxChannelsPerConn {
@@ -807,18 +851,18 @@ func (g *Group) maintain() {
 				log.Printf("[INFO] upstream %s: detected system wake after %s, resetting backoff and clearing stale connections",
 					g.name, elapsed)
 				g.resetReplenishBackoff()
-				// Clear all connections since they are likely stale after sleep
+				// Mark all connections as draining and move them out of the pool.
+				// They will be closed gracefully once idle.
 				g.connsMu.Lock()
-				for _, sc := range g.conns {
-					if sc.sshClient != nil {
-						sc.sshClient.Close()
-					}
-					if sc.adapter != nil {
-						sc.adapter.Close()
-					}
+				oldConns := g.conns
+				for _, sc := range oldConns {
+					sc.markDraining()
 				}
-				g.conns = nil
+				g.conns = nil // Trigger replenish with fresh connections
 				g.connsMu.Unlock()
+
+				// Gracefully close old connections in background once they become idle.
+				go g.closeDrainingConns(oldConns, 30*time.Second)
 			}
 		}
 		g.lastMaintainTime = now

@@ -12,6 +12,7 @@ import (
 	"github.com/hanschad/session-proxy/internal/protocol"
 	"github.com/hanschad/session-proxy/internal/proxy"
 	"github.com/hanschad/session-proxy/internal/router"
+	"github.com/hanschad/session-proxy/internal/ssh"
 	"github.com/hanschad/session-proxy/internal/upstream"
 )
 
@@ -37,6 +38,7 @@ func main() {
 
 	if opt.IsDebug() {
 		protocol.DebugMode = true
+		ssh.DebugMode = true
 		log.Println("[INFO] Debug mode enabled")
 	}
 
@@ -123,7 +125,11 @@ func buildRouter(cfg *config.Config) *router.Router {
 			Upstream: r.Upstream,
 		})
 	}
-	return router.New(routerCfg)
+	rt, err := router.New(routerCfg)
+	if err != nil {
+		log.Fatalf("Invalid router config: %v", err)
+	}
+	return rt
 }
 
 func onConfigReload(newCfg *config.Config, rt *router.Router, pool *upstream.Pool) {
@@ -138,7 +144,10 @@ func onConfigReload(newCfg *config.Config, rt *router.Router, pool *upstream.Poo
 			Upstream: r.Upstream,
 		})
 	}
-	rt.Update(newRouterCfg)
+	if err := rt.Update(newRouterCfg); err != nil {
+		log.Printf("[ERROR] Invalid route config, keeping old rules: %v", err)
+		return
+	}
 	log.Printf("[INFO] Routes reloaded: %d rules", len(newCfg.Routes))
 
 	// Note: Pool reconnection is complex, just log for now

@@ -211,7 +211,7 @@ func (opt *Options) FlagUsages() string {
 }
 
 // Watch watches the config file for changes and calls onChange when it changes.
-// Only routes, upstreams.instances, and default can be hot-reloaded.
+// Only routes and default can be hot-reloaded; upstream changes require restart.
 func (opt *Options) Watch(ctx context.Context, onChange func(*Config, error)) error {
 	if opt.ConfigFile == "" {
 		// Try to get config file from viper
@@ -287,6 +287,11 @@ func (opt *Options) reload() (*Config, error) {
 		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 
+	// Validate upstreams haven't changed (not hot-reloadable)
+	if err := opt.validateUpstreamsUnchanged(newOpt.Upstreams); err != nil {
+		return nil, err
+	}
+
 	// Preserve CLI-only flags
 	newOpt.ConfigFile = opt.ConfigFile
 	newOpt.Debug = opt.Debug
@@ -295,6 +300,43 @@ func (opt *Options) reload() (*Config, error) {
 	newOpt.Listen = opt.Listen
 
 	return newOpt.ToConfig()
+}
+
+// validateUpstreamsUnchanged checks if upstreams configuration has changed.
+func (opt *Options) validateUpstreamsUnchanged(newUpstreams map[string]*Upstream) error {
+	if len(opt.Upstreams) != len(newUpstreams) {
+		return fmt.Errorf("upstream configuration changed, restart required to apply")
+	}
+	for name, oldUp := range opt.Upstreams {
+		newUp, ok := newUpstreams[name]
+		if !ok {
+			return fmt.Errorf("upstream configuration changed, restart required to apply")
+		}
+		if !upstreamsEqual(oldUp, newUp) {
+			return fmt.Errorf("upstream configuration changed, restart required to apply")
+		}
+	}
+	return nil
+}
+
+// upstreamsEqual compares two Upstream configs for equality.
+func upstreamsEqual(a, b *Upstream) bool {
+	if a.SSH.User != b.SSH.User || a.SSH.Key != b.SSH.Key {
+		return false
+	}
+	if a.AWS.Profile != b.AWS.Profile || a.AWS.Region != b.AWS.Region ||
+		a.AWS.AccessKey != b.AWS.AccessKey || a.AWS.SecretKey != b.AWS.SecretKey {
+		return false
+	}
+	if len(a.Instances) != len(b.Instances) {
+		return false
+	}
+	for i := range a.Instances {
+		if a.Instances[i] != b.Instances[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // IsDebug returns whether debug mode is enabled.

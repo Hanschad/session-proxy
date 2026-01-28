@@ -5,7 +5,7 @@ import (
 )
 
 func TestCIDRMatching(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -15,6 +15,9 @@ func TestCIDRMatching(t *testing.T) {
 		},
 		Default: "default",
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	tests := []struct {
 		addr     string
@@ -36,7 +39,7 @@ func TestCIDRMatching(t *testing.T) {
 }
 
 func TestDomainMatching(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -47,6 +50,9 @@ func TestDomainMatching(t *testing.T) {
 		},
 		Default: "fallback",
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	tests := []struct {
 		addr     string
@@ -69,7 +75,7 @@ func TestDomainMatching(t *testing.T) {
 }
 
 func TestMixedMatching(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -79,6 +85,9 @@ func TestMixedMatching(t *testing.T) {
 		},
 		Default: "default",
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	tests := []struct {
 		addr     string
@@ -98,7 +107,10 @@ func TestMixedMatching(t *testing.T) {
 }
 
 func TestEmptyConfig(t *testing.T) {
-	r := New(Config{Default: "fallback"})
+	r, err := New(Config{Default: "fallback"})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	// All addresses should go to default
 	tests := []string{
@@ -116,7 +128,7 @@ func TestEmptyConfig(t *testing.T) {
 }
 
 func TestAddressWithoutPort(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -125,6 +137,9 @@ func TestAddressWithoutPort(t *testing.T) {
 		},
 		Default: "default",
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	// Should work with or without port
 	tests := []struct {
@@ -145,7 +160,7 @@ func TestAddressWithoutPort(t *testing.T) {
 }
 
 func TestCaseInsensitiveDomain(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -155,6 +170,9 @@ func TestCaseInsensitiveDomain(t *testing.T) {
 		},
 		Default: "default",
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	tests := []struct {
 		addr     string
@@ -175,7 +193,7 @@ func TestCaseInsensitiveDomain(t *testing.T) {
 }
 
 func TestNoDefault(t *testing.T) {
-	r := New(Config{
+	r, err := New(Config{
 		Routes: []struct {
 			Match    string
 			Upstream string
@@ -184,6 +202,9 @@ func TestNoDefault(t *testing.T) {
 		},
 		// No default set
 	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
 
 	// Matched address
 	if got := r.Match("10.0.1.5:80"); got != "dev" {

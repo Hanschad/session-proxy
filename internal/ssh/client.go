@@ -2,6 +2,7 @@ package ssh
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"os/user"
@@ -13,6 +14,14 @@ import (
 	"golang.org/x/crypto/ssh/agent"
 	"golang.org/x/term"
 )
+
+var DebugMode bool
+
+func debugLog(format string, args ...interface{}) {
+	if DebugMode {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
 
 func expandPath(path string) string {
 	if strings.HasPrefix(path, "~/") {
@@ -31,21 +40,39 @@ type Config struct {
 func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 	authMethods := []sshlib.AuthMethod{}
 
-	// 1. Try SSH Agent
+	debugLog("SSH Connect: user=%q keyPath=%q", cfg.User, cfg.PrivateKeyPath)
+
+	// 1. Try SSH Agent (keep connection open - agent needs it for signing)
 	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
 		agentConn, err := net.DialTimeout("unix", socket, 1*time.Second)
 		if err == nil {
-			authMethods = append(authMethods, sshlib.PublicKeysCallback(agent.NewClient(agentConn).Signers))
+			agentClient := agent.NewClient(agentConn)
+			// Check if agent has keys before adding auth method
+			signers, err := agentClient.Signers()
+			if err == nil && len(signers) > 0 {
+				debugLog("SSH Agent: found %d keys", len(signers))
+				for i, s := range signers {
+					debugLog("  Agent key[%d]: %s", i, s.PublicKey().Type())
+				}
+				// Use callback to keep agent connection alive during auth
+				authMethods = append(authMethods, sshlib.PublicKeysCallback(agentClient.Signers))
+			} else {
+				debugLog("SSH Agent: no keys or error: %v", err)
+				agentConn.Close()
+			}
+		} else {
+			debugLog("SSH Agent: dial failed: %v", err)
 		}
+	} else {
+		debugLog("SSH Agent: SSH_AUTH_SOCK not set")
 	}
 
 	// 2. Try Private Key
 	if cfg.PrivateKeyPath != "" {
-		key, err := os.ReadFile(expandPath(cfg.PrivateKeyPath))
+		expandedPath := expandPath(cfg.PrivateKeyPath)
+		debugLog("SSH Private Key: loading from %q", expandedPath)
+		key, err := os.ReadFile(expandedPath)
 		if err != nil {
-			// Don't error out, just skip if reading fails? Or maybe error?
-			// Let's print a warning but continue if agent worked?
-			// Actually, if user specified a key, they expect it to work.
 			return nil, fmt.Errorf("failed to read private key: %w", err)
 		}
 
@@ -54,7 +81,10 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 			return nil, fmt.Errorf("failed to parse private key: %w", err)
 		}
 
+		debugLog("SSH Private Key: loaded type=%s", signer.PublicKey().Type())
 		authMethods = append(authMethods, sshlib.PublicKeys(signer))
+	} else {
+		debugLog("SSH Private Key: no key path configured")
 	}
 
 	interactiveAuth := false

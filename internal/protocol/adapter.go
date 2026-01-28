@@ -80,6 +80,12 @@ func looksMostlyText(b []byte) bool {
 	return printable*100/len(b) >= 90
 }
 
+type timeoutError struct{}
+
+func (e timeoutError) Error() string   { return "i/o timeout" }
+func (e timeoutError) Timeout() bool   { return true }
+func (e timeoutError) Temporary() bool { return true }
+
 // Adapter implements net.Conn over an SSM WebSocket session
 type Adapter struct {
 	conn    *websocket.Conn
@@ -104,8 +110,9 @@ type Adapter struct {
 	rxAckCount uint64 // for log sampling; ACK header seq is always 0
 
 	// Read-side pipe (replaces complex buffering)
-	reader *io.PipeReader
-	writer *io.PipeWriter
+	reader       *io.PipeReader
+	writer       *io.PipeWriter
+	readDeadline atomic.Value // stores time.Time
 
 	// Handshake state
 	handshakeComplete     bool
@@ -787,8 +794,36 @@ func (a *Adapter) WaitForHandshake(ctx context.Context) error {
 
 // Read implements net.Conn.Read
 func (a *Adapter) Read(b []byte) (n int, err error) {
-	// Simple delegation to pipe reader
-	return a.reader.Read(b)
+	deadlineVal := a.readDeadline.Load()
+	if deadlineVal == nil {
+		return a.reader.Read(b)
+	}
+	deadline := deadlineVal.(time.Time)
+	if deadline.IsZero() {
+		return a.reader.Read(b)
+	}
+
+	timeout := time.Until(deadline)
+	if timeout <= 0 {
+		return 0, timeoutError{}
+	}
+
+	type readResult struct {
+		n   int
+		err error
+	}
+	resultCh := make(chan readResult, 1)
+	go func() {
+		n, err := a.reader.Read(b)
+		resultCh <- readResult{n, err}
+	}()
+
+	select {
+	case res := <-resultCh:
+		return res.n, res.err
+	case <-time.After(timeout):
+		return 0, timeoutError{}
+	}
 }
 
 // Write implements net.Conn.Write
@@ -980,16 +1015,14 @@ func (a *Adapter) RemoteAddr() net.Addr {
 
 // SetDeadline implements net.Conn
 func (a *Adapter) SetDeadline(t time.Time) error {
-	// net.Conn SetDeadline sets both read and write deadlines.
-	if err := a.conn.SetReadDeadline(t); err != nil {
-		return err
-	}
+	a.readDeadline.Store(t)
 	return a.conn.SetWriteDeadline(t)
 }
 
 // SetReadDeadline implements net.Conn
 func (a *Adapter) SetReadDeadline(t time.Time) error {
-	return a.conn.SetReadDeadline(t)
+	a.readDeadline.Store(t)
+	return nil
 }
 
 // SetWriteDeadline implements net.Conn
