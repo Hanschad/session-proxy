@@ -135,8 +135,10 @@ func (c *Config) validate() error {
 	}
 
 	if c.Default != "" {
-		if _, ok := c.Upstreams[c.Default]; !ok {
-			return fmt.Errorf("default upstream %q not found", c.Default)
+		if c.Default != "DIRECT" {
+			if _, ok := c.Upstreams[c.Default]; !ok {
+				return fmt.Errorf("default upstream %q not found", c.Default)
+			}
 		}
 	}
 
@@ -144,8 +146,10 @@ func (c *Config) validate() error {
 		if r.Match == "" {
 			return fmt.Errorf("route[%d] has no match pattern", i)
 		}
-		if _, ok := c.Upstreams[r.Upstream]; !ok {
-			return fmt.Errorf("route[%d] references unknown upstream %q", i, r.Upstream)
+		if r.Upstream != "DIRECT" {
+			if _, ok := c.Upstreams[r.Upstream]; !ok {
+				return fmt.Errorf("route[%d] references unknown upstream %q", i, r.Upstream)
+			}
 		}
 	}
 

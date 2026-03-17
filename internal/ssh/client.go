@@ -39,12 +39,19 @@ type Config struct {
 
 func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 	authMethods := []sshlib.AuthMethod{}
+	var agentConn net.Conn
+	defer func() {
+		if agentConn != nil {
+			agentConn.Close()
+		}
+	}()
 
 	debugLog("SSH Connect: user=%q keyPath=%q", cfg.User, cfg.PrivateKeyPath)
 
 	// 1. Try SSH Agent (keep connection open - agent needs it for signing)
 	if socket := os.Getenv("SSH_AUTH_SOCK"); socket != "" {
-		agentConn, err := net.DialTimeout("unix", socket, 1*time.Second)
+		var err error
+		agentConn, err = net.DialTimeout("unix", socket, 1*time.Second)
 		if err == nil {
 			agentClient := agent.NewClient(agentConn)
 			// Check if agent has keys before adding auth method
@@ -59,6 +66,7 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 			} else {
 				debugLog("SSH Agent: no keys or error: %v", err)
 				agentConn.Close()
+				agentConn = nil
 			}
 		} else {
 			debugLog("SSH Agent: dial failed: %v", err)

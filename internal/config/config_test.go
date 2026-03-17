@@ -205,6 +205,58 @@ upstreams:
 	}
 }
 
+func TestDirectRouteValidation(t *testing.T) {
+	content := `
+upstreams:
+  dev:
+    instances: [i-1]
+routes:
+  - match: "10.0.0.0/8"
+    upstream: dev
+  - match: "192.168.0.0/16"
+    upstream: DIRECT
+default: dev
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load with DIRECT route should succeed, got: %v", err)
+	}
+
+	if len(cfg.Routes) != 2 {
+		t.Errorf("expected 2 routes, got %d", len(cfg.Routes))
+	}
+	if cfg.Routes[1].Upstream != "DIRECT" {
+		t.Errorf("expected route[1] upstream=DIRECT, got %s", cfg.Routes[1].Upstream)
+	}
+}
+
+func TestDirectDefaultValidation(t *testing.T) {
+	content := `
+upstreams:
+  dev:
+    instances: [i-1]
+default: DIRECT
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	cfg, err := Load(tmpFile)
+	if err != nil {
+		t.Fatalf("Load with DIRECT default should succeed, got: %v", err)
+	}
+
+	if cfg.Default != "DIRECT" {
+		t.Errorf("expected default=DIRECT, got %s", cfg.Default)
+	}
+}
+
 func containsSubstr(s, substr string) bool {
 	for i := 0; i <= len(s)-len(substr); i++ {
 		if s[i:i+len(substr)] == substr {

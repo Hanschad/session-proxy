@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -316,5 +317,66 @@ func TestHandshakeNoAuthMethodMismatch(t *testing.T) {
 	err := <-done
 	if err == nil {
 		t.Error("expected handshake to fail when client doesn't support required auth")
+	}
+}
+
+// mockCloseWriter implements net.Conn and CloseWrite().
+type mockCloseWriter struct {
+	net.Conn
+	closeWriteCalled bool
+	mu               sync.Mutex
+}
+
+func (m *mockCloseWriter) CloseWrite() error {
+	m.mu.Lock()
+	m.closeWriteCalled = true
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *mockCloseWriter) wasCloseWriteCalled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.closeWriteCalled
+}
+
+func TestRelayHalfClose_NonTCP(t *testing.T) {
+	// Create two net.Pipe pairs — one for client side, one for remote side.
+	clientRead, clientWrite := net.Pipe()
+	remoteRead, remoteWrite := net.Pipe()
+
+	// Wrap the "remote" write end as a mockCloseWriter.
+	remote := &mockCloseWriter{Conn: remoteWrite}
+
+	srv := New(&Config{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.relay(1, "test:80", "127.0.0.1:9999", clientRead, remote)
+	}()
+
+	// Write some data from client side, then close client to trigger EOF on client->remote copy.
+	clientWrite.Write([]byte("hello"))
+	clientWrite.Close()
+
+	// Read the data from remote side to let the copy complete.
+	buf := make([]byte, 10)
+	remoteRead.SetReadDeadline(time.Now().Add(2 * time.Second))
+	n, _ := remoteRead.Read(buf)
+	if string(buf[:n]) != "hello" {
+		t.Errorf("expected 'hello', got %q", string(buf[:n]))
+	}
+
+	// Close remote read side to let the remote->client copy complete.
+	remoteRead.Close()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not complete in time")
+	}
+
+	if !remote.wasCloseWriteCalled() {
+		t.Error("CloseWrite was not called on non-TCP connection implementing the interface")
 	}
 }

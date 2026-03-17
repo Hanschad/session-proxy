@@ -216,3 +216,48 @@ func TestNoDefault(t *testing.T) {
 		t.Errorf("Match unmatched = %q, want empty", got)
 	}
 }
+
+func TestDirectRouteMatching(t *testing.T) {
+	r, err := New(Config{
+		Routes: []struct {
+			Match    string
+			Upstream string
+		}{
+			{Match: "10.0.0.0/8", Upstream: "dev"},
+			{Match: "192.168.0.0/16", Upstream: DirectConnection},
+			{Match: "*.local", Upstream: DirectConnection},
+		},
+		Default: "dev",
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	tests := []struct {
+		addr     string
+		expected string
+	}{
+		{"10.0.1.5:80", "dev"},
+		{"192.168.1.100:443", DirectConnection},
+		{"myhost.local:22", DirectConnection},
+		{"8.8.8.8:53", "dev"},
+	}
+
+	for _, tt := range tests {
+		got := r.Match(tt.addr)
+		if got != tt.expected {
+			t.Errorf("Match(%q) = %q, want %q", tt.addr, got, tt.expected)
+		}
+	}
+}
+
+func TestDirectDefaultMatching(t *testing.T) {
+	r, err := New(Config{Default: DirectConnection})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	if got := r.Match("8.8.8.8:53"); got != DirectConnection {
+		t.Fatalf("Match() = %q, want %q", got, DirectConnection)
+	}
+}

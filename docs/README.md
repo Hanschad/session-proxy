@@ -21,4 +21,5 @@
 | Document | Description |
 |----------|-------------|
 | [CHANGELOG.md](CHANGELOG.md) | Version history |
+| [code-review-2026-03-17.md](code-review-2026-03-17.md) | Deep review findings and remediation priorities |
 | [ROADMAP.md](ROADMAP.md) | Future features and backlog |

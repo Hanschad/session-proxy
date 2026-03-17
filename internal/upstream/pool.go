@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/hanschad/session-proxy/internal/aws/ssm"
@@ -515,11 +518,14 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		if result.err != nil {
 			debugLog("upstream %s: dial failed conn=%d sshConn=%d addr=%s dur=%s err=%v",
 				g.name, connID, sc.id, addr, time.Since(start), result.err)
-			log.Printf("[WARN] upstream %s: dial failed: %v", g.name, result.err)
-			// Mark this specific connection as broken; maintain() will handle reconnect.
-			g.connsMu.Lock()
-			g.removeConn(sc)
-			g.connsMu.Unlock()
+			if isTransportError(result.err) {
+				log.Printf("[WARN] upstream %s: dial failed (transport broken, evicting conn=%d): %v", g.name, sc.id, result.err)
+				g.connsMu.Lock()
+				g.removeConn(sc)
+				g.connsMu.Unlock()
+			} else {
+				log.Printf("[WARN] upstream %s: dial failed (target-specific, conn=%d kept): %v", g.name, sc.id, result.err)
+			}
 			return nil, fmt.Errorf("upstream %s: dial failed: %w", g.name, result.err)
 		}
 
@@ -529,6 +535,32 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 
 		return &trackedConn{Conn: result.conn, sc: sc}, nil
 	}
+}
+
+// isTransportError returns true if the error indicates the SSH transport
+// itself is broken (EOF, broken pipe, connection reset, closed connection,
+// or SSH protocol errors). Target-specific errors like "connection refused"
+// or "host unreachable" return false.
+func isTransportError(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "use of closed network connection") {
+		return true
+	}
+	if strings.Contains(msg, "ssh: unexpected packet") ||
+		strings.Contains(msg, "ssh: disconnect") ||
+		strings.Contains(msg, "ssh: handshake failed") {
+		return true
+	}
+	return false
 }
 
 // removeConn removes a specific connection from the pool and closes it.

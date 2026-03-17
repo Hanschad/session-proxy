@@ -305,8 +305,8 @@ func (s *Server) relay(connID uint64, target, clientRemoteAddr string, client, r
 		buf := make([]byte, 32*1024)
 		n, err := io.CopyBuffer(remote, client, buf)
 		c2r = copyResult{n: n, err: err}
-		if tc, ok := remote.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
 		}
 	}()
 
@@ -315,8 +315,8 @@ func (s *Server) relay(connID uint64, target, clientRemoteAddr string, client, r
 		buf := make([]byte, 32*1024)
 		n, err := io.CopyBuffer(client, remote, buf)
 		r2c = copyResult{n: n, err: err}
-		if tc, ok := client.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
+		if cw, ok := client.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
 		}
 	}()
 

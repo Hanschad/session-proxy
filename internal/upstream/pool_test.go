@@ -2,8 +2,11 @@ package upstream
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -268,3 +271,38 @@ func TestMaintainLoopExitsOnContextCancel(t *testing.T) {
 
 // Ensure gossh import is used
 var _ *gossh.Client = nil
+
+func TestIsTransportError(t *testing.T) {
+	tests := []struct {
+		name      string
+		err       error
+		wantTrans bool
+	}{
+		{"io.EOF", io.EOF, true},
+		{"io.ErrUnexpectedEOF", io.ErrUnexpectedEOF, true},
+		{"net.ErrClosed", net.ErrClosed, true},
+		{"broken pipe", syscall.EPIPE, true},
+		{"connection reset", syscall.ECONNRESET, true},
+		{"closed connection", fmt.Errorf("use of closed network connection"), true},
+		{"ssh unexpected packet", fmt.Errorf("ssh: unexpected packet"), true},
+		{"ssh disconnect", fmt.Errorf("ssh: disconnect, reason 11:"), true},
+		{"ssh handshake failed", fmt.Errorf("ssh: handshake failed"), true},
+		{"connection refused", syscall.ECONNREFUSED, false},
+		{"host unreachable", syscall.EHOSTUNREACH, false},
+		{"network unreachable", syscall.ENETUNREACH, false},
+		{"generic dial error", fmt.Errorf("dial tcp 10.0.0.1:80: connection refused"), false},
+		{"random error", fmt.Errorf("something else"), false},
+		{"wrapped EOF", fmt.Errorf("read failed: %w", io.EOF), true},
+		{"wrapped net.ErrClosed", fmt.Errorf("write failed: %w", net.ErrClosed), true},
+		{"wrapped refused", fmt.Errorf("connect: %w", syscall.ECONNREFUSED), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := isTransportError(tt.err)
+			if got != tt.wantTrans {
+				t.Errorf("isTransportError(%v) = %v, want %v", tt.err, got, tt.wantTrans)
+			}
+		})
+	}
+}

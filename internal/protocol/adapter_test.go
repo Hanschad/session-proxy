@@ -3,6 +3,8 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -205,5 +207,276 @@ func TestAdapterHandleAcknowledge_MismatchIgnored(t *testing.T) {
 	}
 	if a.outgoingOldestSeq != seq {
 		t.Fatalf("expected outgoingOldestSeq=%d, got %d", seq, a.outgoingOldestSeq)
+	}
+}
+
+func TestWaitForHandshake_AdapterClosedBeforeComplete(t *testing.T) {
+	a := &Adapter{
+		handshakeDone: make(chan struct{}),
+		done:          make(chan struct{}),
+	}
+
+	// Close adapter before handshake completes
+	close(a.done)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.WaitForHandshake(ctx)
+	if err == nil {
+		t.Fatal("expected error when adapter closed before handshake")
+	}
+	if err == context.DeadlineExceeded {
+		t.Fatal("should not wait for context timeout; should fail fast on adapter close")
+	}
+}
+
+func TestWaitForHandshake_ReturnsCloseReason(t *testing.T) {
+	want := io.ErrUnexpectedEOF
+	a := &Adapter{
+		handshakeDone: make(chan struct{}),
+		done:          make(chan struct{}),
+	}
+	a.closeWithError(want)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.WaitForHandshake(ctx)
+	if !errors.Is(err, errAdapterClosedBeforeHandshake) {
+		t.Fatalf("expected handshake-close wrapper, got %v", err)
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("expected close reason %v, got %v", want, err)
+	}
+}
+
+func TestWaitForHandshake_PrefersCompletedHandshake(t *testing.T) {
+	a := &Adapter{
+		handshakeDone: make(chan struct{}),
+		done:          make(chan struct{}),
+	}
+	close(a.handshakeDone)
+	close(a.done)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := a.WaitForHandshake(ctx); err != nil {
+		t.Fatalf("expected handshake success to win, got %v", err)
+	}
+}
+
+func TestHandleHandshakeRequestPayload_WriteFailureClosesAdapter(t *testing.T) {
+	a, cleanup := newBareTestAdapter(t)
+	defer cleanup()
+
+	if err := a.conn.Close(); err != nil {
+		t.Fatalf("close websocket: %v", err)
+	}
+
+	msg := &AgentMessage{
+		Header: AgentMessageHeader{
+			MessageType:    MsgTypeOutputStreamData,
+			SequenceNumber: 1,
+			MessageId:      uuid.New(),
+			PayloadType:    PayloadTypeHandshakeRequest,
+		},
+		Payload: []byte(`{"MessageSchemaVersion":"1.0"}`),
+	}
+
+	a.handleHandshakeRequestPayload(msg, false)
+
+	select {
+	case <-a.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("adapter did not close after handshake write failure")
+	}
+
+	if err := a.CloseReason(); err == nil {
+		t.Fatal("expected close reason after handshake write failure")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := a.WaitForHandshake(ctx)
+	if !errors.Is(err, errAdapterClosedBeforeHandshake) {
+		t.Fatalf("expected handshake-close wrapper, got %v", err)
+	}
+}
+
+func TestAddOutgoing_ClosedAdapter(t *testing.T) {
+	a, cleanup := newTestAdapter(t)
+	defer cleanup()
+
+	// Fill the buffer to trigger backpressure
+	a.outgoing[0] = &outgoingMessage{msgID: uuid.New(), data: make([]byte, 100), lastSent: time.Now()}
+	a.outgoingBytes = 100
+	a.outgoingOldestSeq = 0
+	a.maxOutgoingUnackedBytes = 100
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- a.addOutgoing(1, uuid.New(), make([]byte, 10))
+	}()
+
+	// Give the goroutine time to enter Wait()
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the adapter through the public path — should wake the blocked writer.
+	a.Close()
+
+	select {
+	case err := <-errCh:
+		if err != io.ErrClosedPipe {
+			t.Fatalf("expected io.ErrClosedPipe, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("addOutgoing did not return after adapter close; deadlock")
+	}
+}
+
+func newBareTestAdapter(t *testing.T) (*Adapter, func()) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		server.Close()
+		t.Fatalf("Dial websocket: %v", err)
+	}
+
+	reader, writer := io.Pipe()
+	adapter := &Adapter{
+		conn:                    conn,
+		reader:                  reader,
+		writer:                  writer,
+		chunkSize:               defaultStreamChunkSize,
+		seenMsgIds:              make(map[uuid.UUID]int64),
+		handshakeDone:           make(chan struct{}),
+		done:                    make(chan struct{}),
+		incomingMsgBuffer:       make(map[int64]*AgentMessage),
+		outgoing:                make(map[int64]*outgoingMessage),
+		outgoingOldestSeq:       -1,
+		rto:                     defaultRetransmissionTimeout,
+		maxOutgoingUnackedBytes: defaultMaxOutgoingUnackedBytes,
+	}
+	adapter.outgoingCond = sync.NewCond(&adapter.outgoingMu)
+
+	cleanup := func() {
+		adapter.Close()
+		server.Close()
+	}
+	return adapter, cleanup
+}
+
+// newTestAdapter creates a minimal Adapter backed by a real WebSocket for
+// behavior-level tests. The returned server and cleanup func must be deferred.
+func newTestAdapter(t *testing.T) (*Adapter, func()) {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer ws.Close()
+		// Read and discard — acts as a black hole (never ACKs).
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	adapter, err := NewAdapter(ctx, url, "test-token")
+	if err != nil {
+		server.Close()
+		t.Fatalf("NewAdapter: %v", err)
+	}
+
+	cleanup := func() {
+		adapter.Close()
+		server.Close()
+	}
+	return adapter, cleanup
+}
+
+func TestResendLoop_MaxAttemptsClosesAdapter(t *testing.T) {
+	adapter, cleanup := newTestAdapter(t)
+	defer cleanup()
+
+	// Build a valid binary frame so writeRaw succeeds.
+	msg, err := NewInputMessage([]byte("test"), 0)
+	if err != nil {
+		t.Fatalf("NewInputMessage: %v", err)
+	}
+	frame, err := msg.MarshalBinary()
+	if err != nil {
+		t.Fatalf("MarshalBinary: %v", err)
+	}
+
+	// Inject a message that is already near the resend limit with an expired RTO
+	// so the resendLoop will hit the cutoff within a few ticks.
+	adapter.outgoingMu.Lock()
+	adapter.outgoing[0] = &outgoingMessage{
+		msgID:       msg.Header.MessageId,
+		data:        frame,
+		lastSent:    time.Now().Add(-10 * time.Second),
+		resendCount: maxResendAttempts, // Already at limit
+	}
+	adapter.outgoingOldestSeq = 0
+	adapter.outgoingBytes = int64(len(frame))
+	adapter.outgoingMu.Unlock()
+
+	// resendLoop is already running (started by NewAdapter).
+	// Wait for the adapter to close itself.
+	select {
+	case <-adapter.Done():
+		// Success — resendLoop detected the exhausted budget and closed the adapter.
+	case <-time.After(5 * time.Second):
+		t.Fatal("adapter was not closed after exceeding maxResendAttempts; resendLoop behavior regression")
+	}
+}
+
+func TestPausePublication_BoundedTimeout(t *testing.T) {
+	adapter, cleanup := newTestAdapter(t)
+	defer cleanup()
+
+	// Pause publication and backdate pausedSince so the resendLoop sees it as expired.
+	adapter.pausePublication()
+
+	adapter.pauseMu.Lock()
+	if !adapter.paused {
+		adapter.pauseMu.Unlock()
+		t.Fatal("expected paused=true after pausePublication()")
+	}
+	adapter.pausedSince = time.Now().Add(-maxPauseTime - 1*time.Second)
+	adapter.pauseMu.Unlock()
+
+	// resendLoop is already running; it should detect the expired pause and close.
+	select {
+	case <-adapter.Done():
+		// Success — adapter was closed due to prolonged pause.
+	case <-time.After(5 * time.Second):
+		t.Fatal("adapter was not closed after exceeding maxPauseTime; pause timeout behavior regression")
 	}
 }

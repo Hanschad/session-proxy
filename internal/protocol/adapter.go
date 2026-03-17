@@ -3,6 +3,7 @@ package protocol
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -47,6 +48,15 @@ const (
 	maxRetransmissionTimeout     = 1 * time.Second
 	resendSleepInterval          = 100 * time.Millisecond
 
+	// maxResendAttempts bounds how many times we retransmit the oldest unacked message.
+	// After this many attempts without ACK, the transport is considered dead.
+	// At ~1s max RTO this gives ~60s of retransmission before giving up.
+	maxResendAttempts = 60
+
+	// maxPauseTime bounds how long the adapter stays in pause_publication state.
+	// If the remote side pauses us for longer than this, the transport is considered dead.
+	maxPauseTime = 45 * time.Second
+
 	// Upper bound on buffered, unacknowledged outgoing data.
 	// For a TCP proxy, dropping is not acceptable; we will backpressure writes if this is exceeded.
 	// A conservative default send window to avoid MGS/server-side channel closures under sustained upload.
@@ -57,9 +67,10 @@ const (
 )
 
 type outgoingMessage struct {
-	msgID    uuid.UUID
-	data     []byte
-	lastSent time.Time
+	msgID       uuid.UUID
+	data        []byte
+	lastSent    time.Time
+	resendCount int
 }
 
 func looksMostlyText(b []byte) bool {
@@ -86,6 +97,13 @@ func (e timeoutError) Error() string   { return "i/o timeout" }
 func (e timeoutError) Timeout() bool   { return true }
 func (e timeoutError) Temporary() bool { return true }
 
+var (
+	errAdapterClosedBeforeHandshake = errors.New("adapter closed before handshake completed")
+	errChannelClosedByRemote        = errors.New("channel closed by remote")
+	errPausePublicationTimedOut     = errors.New("pause_publication exceeded limit")
+	errResendAttemptsExceeded       = errors.New("retransmission attempts exceeded limit")
+)
+
 // Adapter implements net.Conn over an SSM WebSocket session
 type Adapter struct {
 	conn    *websocket.Conn
@@ -94,9 +112,10 @@ type Adapter struct {
 
 	chunkSize int
 
-	pauseMu sync.Mutex
-	paused  bool
-	pauseCh chan struct{}
+	pauseMu     sync.Mutex
+	paused      bool
+	pauseCh     chan struct{}
+	pausedSince time.Time
 
 	// Outgoing reliability/flow control (mirrors amazon-ssm-agent datachannel behavior)
 	outgoingMu              sync.Mutex
@@ -104,6 +123,7 @@ type Adapter struct {
 	outgoingOldestSeq       int64                      // -1 means empty
 	outgoingBytes           int64
 	outgoingCond            *sync.Cond
+	outgoingClosed          bool // set under outgoingMu by Close(); checked by addOutgoing
 	rto                     time.Duration
 	maxOutgoingUnackedBytes int64
 
@@ -130,8 +150,10 @@ type Adapter struct {
 	incomingMsgBufMu  sync.Mutex              // Protects incomingMsgBuffer
 
 	// Lifecycle management
-	done      chan struct{}
-	closeOnce sync.Once
+	done          chan struct{}
+	closeOnce     sync.Once
+	closeReasonMu sync.Mutex
+	closeReason   error // first error wins
 }
 
 // ClientVersion is the SSM protocol version reported to AWS SSM service.
@@ -139,11 +161,14 @@ type Adapter struct {
 const ClientVersion = "1.2.0.0"
 
 // PingInterval is the interval for sending WebSocket ping frames to keep the connection alive.
-const PingInterval = 1 * time.Minute
+// Reduced from 1 minute to 30 seconds to detect half-dead connections faster
+// while remaining tolerant of temporary packet loss.
+const PingInterval = 30 * time.Second
 
 const (
 	// pongWait is how long we allow the peer to be silent (no pongs) before treating the
 	// connection as dead. This is critical to avoid half-open connections that hang reads.
+	// At 30s ping interval, this gives ~70s tolerance (miss 2 pings + margin).
 	pongWait = 2*PingInterval + 10*time.Second
 	// writeWait is the max time allowed for a single WebSocket write.
 	writeWait = 10 * time.Second
@@ -259,12 +284,11 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 }
 
 func (a *Adapter) readLoop() {
-	defer a.Close()
-
 	for {
 		msg, err := a.readMessage()
 		if err != nil {
 			a.writer.CloseWithError(err)
+			a.closeWithError(err)
 			return
 		}
 		if msg == nil {
@@ -349,6 +373,7 @@ func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
 			log.Printf("[WARN] channel_closed by remote (payload_len=%d)", len(msg.Payload))
 		}
 		a.writer.CloseWithError(io.EOF)
+		a.closeWithError(errChannelClosedByRemote)
 		return false
 
 	default:
@@ -460,22 +485,18 @@ func (a *Adapter) addOutgoing(seq int64, msgID uuid.UUID, data []byte) error {
 
 	logged := false
 	for a.outgoingBytes+need > a.maxOutgoingUnackedBytes {
+		if a.outgoingClosed {
+			return io.ErrClosedPipe
+		}
 		if !logged {
 			debugLog("Outgoing buffer full (bytes=%d need=%d limit=%d), backpressuring", a.outgoingBytes, need, a.maxOutgoingUnackedBytes)
 			logged = true
 		}
 		a.outgoingCond.Wait()
-		select {
-		case <-a.done:
-			return io.ErrClosedPipe
-		default:
-		}
 	}
 
-	select {
-	case <-a.done:
+	if a.outgoingClosed {
 		return io.ErrClosedPipe
-	default:
 	}
 
 	a.outgoing[seq] = &outgoingMessage{msgID: msgID, data: data, lastSent: time.Now()}
@@ -529,10 +550,17 @@ func (a *Adapter) resendLoop() {
 		case <-ticker.C:
 		}
 
+		// Check pause timeout independently of resend logic.
 		a.pauseMu.Lock()
 		paused := a.paused
+		pausedSince := a.pausedSince
 		a.pauseMu.Unlock()
 		if paused {
+			if !pausedSince.IsZero() && time.Since(pausedSince) > maxPauseTime {
+				log.Printf("[WARN] publication paused for %s (limit=%s), closing adapter", time.Since(pausedSince), maxPauseTime)
+				a.closeWithError(errPausePublicationTimedOut)
+				return
+			}
 			continue
 		}
 
@@ -566,9 +594,23 @@ func (a *Adapter) resendLoop() {
 		if rto <= 0 {
 			rto = defaultRetransmissionTimeout
 		}
+		// After the first resend with no ACK, back off to maxRetransmissionTimeout
+		// so we don't exhaust the attempt budget too quickly on no-ACK paths.
+		if om.resendCount > 0 && rto < maxRetransmissionTimeout {
+			rto = maxRetransmissionTimeout
+		}
+
 		if time.Since(om.lastSent) <= rto {
 			a.outgoingMu.Unlock()
 			continue
+		}
+
+		om.resendCount++
+		if om.resendCount > maxResendAttempts {
+			a.outgoingMu.Unlock()
+			log.Printf("[WARN] oldest unacked message (seq=%d) exceeded max resend attempts (%d), closing adapter", seq, maxResendAttempts)
+			a.closeWithError(errResendAttemptsExceeded)
+			return
 		}
 
 		// Mark resent before sending to avoid tight loops on very small timeouts.
@@ -578,7 +620,7 @@ func (a *Adapter) resendLoop() {
 
 		if err := a.writeRaw(data, MsgTypeInputStreamData, PayloadTypeOutput); err != nil {
 			debugLog("Resend failed: seq=%d err=%v", seq, err)
-			a.Close()
+			a.closeWithError(fmt.Errorf("resend write failed: %w", err))
 			return
 		}
 	}
@@ -633,15 +675,19 @@ func (a *Adapter) handleHandshakeRequestPayload(msg *AgentMessage, isDuplicate b
 		debugLog("Received duplicate HandshakeRequest, resending ACK + Response")
 		if err := a.sendAck(msg); err != nil {
 			debugLog("Ack Send Error: %v", err)
+			a.closeWithError(fmt.Errorf("send duplicate handshake ack: %w", err))
+			return
 		}
 		if err := a.resendHandshakeResponse(); err != nil {
 			debugLog("HandshakeResponse resend error: %v", err)
+			a.closeWithError(fmt.Errorf("resend handshake response: %w", err))
 		}
 		return
 	}
 
 	if err := a.handleHandshakeRequest(msg); err != nil {
 		debugLog("HandshakeRequest handling error: %v", err)
+		a.closeWithError(fmt.Errorf("handle handshake request: %w", err))
 		return
 	}
 
@@ -660,6 +706,7 @@ func (a *Adapter) handleHandshakeCompletePayload(msg *AgentMessage) {
 
 	if err := a.sendAck(msg); err != nil {
 		debugLog("Ack Send Error: %v", err)
+		a.closeWithError(fmt.Errorf("send handshake complete ack: %w", err))
 	}
 }
 
@@ -781,12 +828,30 @@ func (a *Adapter) nextSeq() int64 {
 	return atomic.AddInt64(&a.seqNum, 1) - 1
 }
 
-// WaitForHandshake blocks until the SSM handshake is complete or context is cancelled
+// WaitForHandshake blocks until the SSM handshake is complete, adapter closes, or context is cancelled.
 func (a *Adapter) WaitForHandshake(ctx context.Context) error {
 	select {
 	case <-a.handshakeDone:
 		debugLog("Handshake completed, ready for data transfer")
 		return nil
+	default:
+	}
+
+	select {
+	case <-a.handshakeDone:
+		debugLog("Handshake completed, ready for data transfer")
+		return nil
+	case <-a.done:
+		select {
+		case <-a.handshakeDone:
+			debugLog("Handshake completed before shutdown was observed")
+			return nil
+		default:
+		}
+		if err := a.CloseReason(); err != nil {
+			return fmt.Errorf("%w: %w", errAdapterClosedBeforeHandshake, err)
+		}
+		return errAdapterClosedBeforeHandshake
 	case <-ctx.Done():
 		return ctx.Err()
 	}
@@ -892,6 +957,7 @@ func (a *Adapter) pausePublication() {
 		a.pauseCh = make(chan struct{})
 	}
 	a.paused = true
+	a.pausedSince = time.Now()
 
 	// Log state transition only.
 	a.outgoingMu.Lock()
@@ -949,21 +1015,54 @@ func (a *Adapter) waitForPublication() error {
 	}
 }
 
+// closeWithError records a root-cause error and closes the adapter.
+// The first error stored wins; subsequent calls are no-ops for the reason.
+func (a *Adapter) closeWithError(err error) {
+	a.setCloseReason(err)
+	a.Close()
+}
+
+// CloseReason returns the root-cause error that triggered adapter shutdown, or nil.
+func (a *Adapter) CloseReason() error {
+	a.closeReasonMu.Lock()
+	defer a.closeReasonMu.Unlock()
+	return a.closeReason
+}
+
+func (a *Adapter) setCloseReason(err error) {
+	if err == nil {
+		return
+	}
+
+	a.closeReasonMu.Lock()
+	if a.closeReason == nil {
+		a.closeReason = err
+	}
+	a.closeReasonMu.Unlock()
+}
+
 func (a *Adapter) Close() error {
 	a.closeOnce.Do(func() {
 		debugLog("Closing Adapter")
 		close(a.done) // Signal that adapter is closed
 
 		// Wake any goroutines blocked on outgoing buffer backpressure.
+		a.outgoingMu.Lock()
+		a.outgoingClosed = true
 		if a.outgoingCond != nil {
-			a.outgoingMu.Lock()
 			a.outgoingCond.Broadcast()
-			a.outgoingMu.Unlock()
 		}
+		a.outgoingMu.Unlock()
 
-		a.reader.Close()
-		a.writer.Close()
-		a.conn.Close()
+		if a.reader != nil {
+			a.reader.Close()
+		}
+		if a.writer != nil {
+			a.writer.Close()
+		}
+		if a.conn != nil {
+			a.conn.Close()
+		}
 	})
 	return nil
 }
@@ -989,7 +1088,7 @@ func (a *Adapter) startPings() {
 
 			if err != nil {
 				debugLog("WebSocket Ping failed: %v, closing adapter to trigger reconnect", err)
-				a.Close()
+				a.closeWithError(fmt.Errorf("websocket ping failed: %w", err))
 				return
 			}
 			debugLog("WebSocket Ping sent")
@@ -1042,6 +1141,8 @@ func (a *Adapter) handleDataMessage(msg *AgentMessage) {
 	// Always send ACK (even for out-of-order or duplicate messages)
 	if err := a.sendAck(msg); err != nil {
 		debugLog("Ack Send Error: %v", err)
+		a.closeWithError(fmt.Errorf("send data ack: %w", err))
+		return
 	}
 
 	if seq == a.expectedSeqNum {
