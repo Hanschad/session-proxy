@@ -129,10 +129,11 @@ type Adapter struct {
 
 	rxAckCount uint64 // for log sampling; ACK header seq is always 0
 
-	// Read-side pipe (replaces complex buffering)
-	reader       *io.PipeReader
-	writer       *io.PipeWriter
-	readDeadline atomic.Value // stores time.Time
+	// Read-side stream used to bridge SSM frames into net.Conn reads.
+	// net.Pipe gives us blocking reads plus native deadline support without spawning
+	// a goroutine per timed read.
+	streamReader net.Conn
+	streamWriter net.Conn
 
 	// Handshake state
 	handshakeComplete     bool
@@ -220,11 +221,11 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		return nil, fmt.Errorf("failed to send OpenDataChannel message: %w", err)
 	}
 
-	pr, pw := io.Pipe()
+	readConn, writeConn := net.Pipe()
 	adapter := &Adapter{
 		conn:              wsConn,
-		reader:            pr,
-		writer:            pw,
+		streamReader:      readConn,
+		streamWriter:      writeConn,
 		seenMsgIds:        make(map[uuid.UUID]int64),
 		handshakeDone:     make(chan struct{}),
 		done:              make(chan struct{}),
@@ -287,7 +288,9 @@ func (a *Adapter) readLoop() {
 	for {
 		msg, err := a.readMessage()
 		if err != nil {
-			a.writer.CloseWithError(err)
+			if a.streamWriter != nil {
+				_ = a.streamWriter.Close()
+			}
 			a.closeWithError(err)
 			return
 		}
@@ -372,7 +375,9 @@ func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
 		} else {
 			log.Printf("[WARN] channel_closed by remote (payload_len=%d)", len(msg.Payload))
 		}
-		a.writer.CloseWithError(io.EOF)
+		if a.streamWriter != nil {
+			_ = a.streamWriter.Close()
+		}
 		a.closeWithError(errChannelClosedByRemote)
 		return false
 
@@ -859,36 +864,14 @@ func (a *Adapter) WaitForHandshake(ctx context.Context) error {
 
 // Read implements net.Conn.Read
 func (a *Adapter) Read(b []byte) (n int, err error) {
-	deadlineVal := a.readDeadline.Load()
-	if deadlineVal == nil {
-		return a.reader.Read(b)
+	if a.streamReader == nil {
+		return 0, io.ErrClosedPipe
 	}
-	deadline := deadlineVal.(time.Time)
-	if deadline.IsZero() {
-		return a.reader.Read(b)
+	n, err = a.streamReader.Read(b)
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return n, timeoutError{}
 	}
-
-	timeout := time.Until(deadline)
-	if timeout <= 0 {
-		return 0, timeoutError{}
-	}
-
-	type readResult struct {
-		n   int
-		err error
-	}
-	resultCh := make(chan readResult, 1)
-	go func() {
-		n, err := a.reader.Read(b)
-		resultCh <- readResult{n, err}
-	}()
-
-	select {
-	case res := <-resultCh:
-		return res.n, res.err
-	case <-time.After(timeout):
-		return 0, timeoutError{}
-	}
+	return n, err
 }
 
 // Write implements net.Conn.Write
@@ -1044,7 +1027,9 @@ func (a *Adapter) setCloseReason(err error) {
 func (a *Adapter) Close() error {
 	a.closeOnce.Do(func() {
 		debugLog("Closing Adapter")
-		close(a.done) // Signal that adapter is closed
+		if a.done != nil {
+			close(a.done) // Signal that adapter is closed
+		}
 
 		// Wake any goroutines blocked on outgoing buffer backpressure.
 		a.outgoingMu.Lock()
@@ -1054,14 +1039,14 @@ func (a *Adapter) Close() error {
 		}
 		a.outgoingMu.Unlock()
 
-		if a.reader != nil {
-			a.reader.Close()
+		if a.streamReader != nil {
+			_ = a.streamReader.Close()
 		}
-		if a.writer != nil {
-			a.writer.Close()
+		if a.streamWriter != nil {
+			_ = a.streamWriter.Close()
 		}
 		if a.conn != nil {
-			a.conn.Close()
+			_ = a.conn.Close()
 		}
 	})
 	return nil
@@ -1114,14 +1099,20 @@ func (a *Adapter) RemoteAddr() net.Addr {
 
 // SetDeadline implements net.Conn
 func (a *Adapter) SetDeadline(t time.Time) error {
-	a.readDeadline.Store(t)
+	if a.streamReader != nil {
+		if err := a.streamReader.SetReadDeadline(t); err != nil {
+			return err
+		}
+	}
 	return a.conn.SetWriteDeadline(t)
 }
 
 // SetReadDeadline implements net.Conn
 func (a *Adapter) SetReadDeadline(t time.Time) error {
-	a.readDeadline.Store(t)
-	return nil
+	if a.streamReader == nil {
+		return io.ErrClosedPipe
+	}
+	return a.streamReader.SetReadDeadline(t)
 }
 
 // SetWriteDeadline implements net.Conn
@@ -1182,7 +1173,10 @@ func (a *Adapter) processBufferedMessages() {
 
 // processMessage writes the message payload to the pipe.
 func (a *Adapter) processMessage(msg *AgentMessage) {
-	if _, err := a.writer.Write(msg.Payload); err != nil {
+	if a.streamWriter == nil {
+		return
+	}
+	if _, err := a.streamWriter.Write(msg.Payload); err != nil {
 		debugLog("Pipe Write Error: %v", err)
 	}
 }

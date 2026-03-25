@@ -30,6 +30,16 @@ func debugLog(format string, args ...interface{}) {
 
 var nextSSHConnID uint64
 
+var groupConnectHook = func(g *Group, ctx context.Context) error {
+	return g.connect(ctx)
+}
+
+var newSSMClientHook = ssm.NewClient
+
+var groupConnectSingleHook = func(g *Group, ctx context.Context, instanceID string) (*sshConn, error) {
+	return g.connectSingle(ctx, instanceID)
+}
+
 // Pool manages multiple upstream connections.
 type Pool struct {
 	groups map[string]*Group
@@ -38,9 +48,9 @@ type Pool struct {
 
 // sshConn represents a single SSH connection through SSM.
 type sshConn struct {
-	id uint64
+	id    uint64
+	group *Group
 
-	ssmClient *ssm.Client
 	adapter   *protocol.Adapter
 	sshClient *gossh.Client
 
@@ -126,6 +136,9 @@ func (c *trackedConn) Close() error {
 	err := c.Conn.Close()
 	c.once.Do(func() {
 		atomic.AddInt64(&c.sc.activeChannels, -1)
+		if c.sc.group != nil {
+			c.sc.group.signalCapacityChange()
+		}
 	})
 	return err
 }
@@ -143,6 +156,13 @@ type Group struct {
 	conns    []*sshConn
 	connsMu  sync.RWMutex
 	nextConn uint64 // Round-robin counter
+	waitMu   sync.Mutex
+	waitCh   chan struct{}
+
+	ssmMu     sync.Mutex
+	ssmClient *ssm.Client
+
+	maintainCh chan struct{}
 
 	// Serialize pool growth calculations and bound concurrent SSM+SSH session creation.
 	scaleMu       sync.Mutex
@@ -190,11 +210,74 @@ func NewPool(cfg *config.Config) *Pool {
 			awsCfg:                  up.AWS,
 			instances:               up.Instances,
 			replenishRetryer:        retryer,
+			maintainCh:              make(chan struct{}, 1),
 			sleepDetectionThreshold: cfg.SleepDetectionThreshold,
 		}
 	}
 
 	return p
+}
+
+func (g *Group) waitChannel() <-chan struct{} {
+	g.waitMu.Lock()
+	defer g.waitMu.Unlock()
+
+	if g.waitCh == nil {
+		g.waitCh = make(chan struct{})
+	}
+
+	return g.waitCh
+}
+
+func (g *Group) signalCapacityChange() {
+	g.waitMu.Lock()
+	ch := g.waitCh
+	g.waitCh = nil
+	g.waitMu.Unlock()
+
+	if ch != nil {
+		close(ch)
+	}
+}
+
+func (g *Group) notifyMaintain() {
+	if g.maintainCh == nil {
+		return
+	}
+	select {
+	case g.maintainCh <- struct{}{}:
+	default:
+	}
+}
+
+func (g *Group) releaseInflight(sc *sshConn) {
+	if sc == nil {
+		return
+	}
+	atomic.AddInt64(&sc.inflightDials, -1)
+	g.signalCapacityChange()
+}
+
+func (g *Group) getSSMClient(ctx context.Context) (*ssm.Client, error) {
+	g.ssmMu.Lock()
+	defer g.ssmMu.Unlock()
+
+	if g.ssmClient != nil {
+		return g.ssmClient, nil
+	}
+
+	client, err := newSSMClientHook(ctx, ssm.ClientConfig{
+		Profile:   g.awsCfg.Profile,
+		Region:    g.awsCfg.Region,
+		AccessKey: g.awsCfg.AccessKey,
+		SecretKey: g.awsCfg.SecretKey,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create SSM client: %w", err)
+	}
+
+	g.ssmClient = client
+	return client, nil
 }
 
 // Connect establishes connections to all upstreams on startup.
@@ -203,16 +286,67 @@ func (p *Pool) Connect(ctx context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if len(p.groups) == 0 {
+		return nil
+	}
+
+	connectCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type connectResult struct {
+		name  string
+		group *Group
+		err   error
+	}
+
+	results := make(chan connectResult, len(p.groups))
+	var wg sync.WaitGroup
+
 	for name, group := range p.groups {
 		log.Printf("[INFO] Connecting to upstream %q...", name)
-		if err := group.connect(ctx); err != nil {
-			return fmt.Errorf("upstream %q: %w", name, err)
-		}
-		log.Printf("[INFO] Upstream %q connected via instance %s", name, group.currentInstance())
+		wg.Add(1)
+		go func(name string, group *Group) {
+			defer wg.Done()
+			err := groupConnectHook(group, connectCtx)
+			if err != nil {
+				cancel()
+				results <- connectResult{name: name, group: group, err: fmt.Errorf("upstream %q: %w", name, err)}
+				return
+			}
+			results <- connectResult{name: name, group: group}
+		}(name, group)
+	}
 
-		// Start connection maintenance goroutine
-		group.ctx, group.cancel = context.WithCancel(ctx)
-		go group.maintain()
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	connected := make([]connectResult, 0, len(p.groups))
+	for res := range results {
+		if res.err != nil {
+			if firstErr == nil {
+				firstErr = res.err
+			}
+			continue
+		}
+		connected = append(connected, res)
+	}
+
+	if firstErr != nil {
+		for _, res := range connected {
+			res.group.connsMu.Lock()
+			res.group.cleanup()
+			res.group.connsMu.Unlock()
+		}
+		return firstErr
+	}
+
+	for _, res := range connected {
+		log.Printf("[INFO] Upstream %q connected via instance %s", res.name, res.group.currentInstance())
+		res.group.ctx, res.group.cancel = context.WithCancel(ctx)
+		go res.group.maintain()
 	}
 
 	return nil
@@ -399,7 +533,7 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 			scaleCtx, cancel := context.WithTimeout(baseCtx, 60*time.Second)
 			defer cancel()
 
-			sc, err := g.connectSingle(scaleCtx, instance)
+			sc, err := groupConnectSingleHook(g, scaleCtx, instance)
 			if err != nil {
 				log.Printf("[WARN] upstream %s: scale-up connection failed: %v", g.name, err)
 				return
@@ -409,6 +543,8 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 			g.conns = append(g.conns, sc)
 			current := len(g.conns)
 			g.connsMu.Unlock()
+			g.signalCapacityChange()
+			g.notifyMaintain()
 
 			log.Printf("[INFO] upstream %s: scaled pool connection established (pool=%d) (sshConn=%d)", g.name, current, sc.id)
 		}()
@@ -427,12 +563,13 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 
 	var sc *sshConn
 	for {
+		waitCh := g.waitChannel()
 		sc = g.selectConnWithCapacity()
 		if sc != nil {
 			// Reserve capacity for this dial.
 			inflight := atomic.AddInt64(&sc.inflightDials, 1)
 			if atomic.LoadInt64(&sc.activeChannels)+inflight > maxChannelsPerConn {
-				atomic.AddInt64(&sc.inflightDials, -1)
+				g.releaseInflight(sc)
 				continue
 			}
 			break
@@ -453,13 +590,24 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 
 		_ = g.startScaleIfNeeded(connID, addr)
 
+		if g.selectConnWithCapacity() != nil {
+			continue
+		}
+
+		g.connsMu.RLock()
+		poolSize = len(g.conns)
+		g.connsMu.RUnlock()
+		if poolSize == 0 {
+			return nil, fmt.Errorf("upstream %s: not connected", g.name)
+		}
+
 		select {
 		case <-ctx.Done():
 			return nil, fmt.Errorf("upstream %s: dial wait for capacity: %w", g.name, ctx.Err())
-		case <-time.After(100 * time.Millisecond):
+		case <-waitCh:
 		}
 	}
-	defer atomic.AddInt64(&sc.inflightDials, -1)
+	defer g.releaseInflight(sc)
 
 	if sc == nil || sc.sshClient == nil {
 		return nil, fmt.Errorf("upstream %s: not connected", g.name)
@@ -575,6 +723,8 @@ func (g *Group) removeConn(sc *sshConn) {
 			if sc.adapter != nil {
 				sc.adapter.Close()
 			}
+			g.signalCapacityChange()
+			g.notifyMaintain()
 			return
 		}
 	}
@@ -655,7 +805,7 @@ func (g *Group) connectPool(ctx context.Context, instanceID string) error {
 		go func() {
 			connCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-			sc, err := g.connectSingle(connCtx, instanceID)
+			sc, err := groupConnectSingleHook(g, connCtx, instanceID)
 			results <- connResult{sc: sc, err: err, idx: i}
 		}()
 	}
@@ -682,6 +832,7 @@ func (g *Group) connectPool(ctx context.Context, instanceID string) error {
 	g.connsMu.Lock()
 	g.conns = newConns
 	g.connsMu.Unlock()
+	g.signalCapacityChange()
 
 	log.Printf("[INFO] upstream %s: pool ready with %d connections", g.name, len(newConns))
 	return nil
@@ -689,18 +840,14 @@ func (g *Group) connectPool(ctx context.Context, instanceID string) error {
 
 // connectSingle establishes a single SSM → SSH connection.
 func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn, error) {
-	// Create SSM client
+	// Reuse a single AWS SDK SSM client per upstream group to reduce config loading
+	// overhead and keep the SDK transport warm across pool replenishment.
 	stepStart := time.Now()
-	ssmClient, err := ssm.NewClient(ctx, ssm.ClientConfig{
-		Profile:   g.awsCfg.Profile,
-		Region:    g.awsCfg.Region,
-		AccessKey: g.awsCfg.AccessKey,
-		SecretKey: g.awsCfg.SecretKey,
-	})
+	ssmClient, err := g.getSSMClient(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("create SSM client: %w", err)
+		return nil, err
 	}
-	debugLog("upstream %s: connectSingle step=ssm_client ok dur=%s", g.name, time.Since(stepStart))
+	debugLog("upstream %s: connectSingle step=ssm_client ready dur=%s", g.name, time.Since(stepStart))
 
 	log.Printf("[INFO] upstream %s: starting SSM session to %s (region=%s)...",
 		g.name, instanceID, ssmClient.Region())
@@ -740,7 +887,7 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 
 	return &sshConn{
 		id:        atomic.AddUint64(&nextSSHConnID, 1),
-		ssmClient: ssmClient,
+		group:     g,
 		adapter:   adapter,
 		sshClient: sshClient,
 	}, nil
@@ -833,7 +980,7 @@ func (g *Group) replenishOnce(instance string, attemptID uint64) {
 	start := time.Now()
 	debugLog("upstream %s: replenish attempt start (attempt=%d instance=%s timeout=%s)", g.name, attemptID, instance, replenishTimeout)
 
-	sc, err := g.connectSingle(ctx, instance)
+	sc, err := groupConnectSingleHook(g, ctx, instance)
 	if err != nil {
 		delay, failures := g.recordReplenishFailure()
 		log.Printf("[WARN] upstream %s: replenish attempt failed (attempt=%d) after %s: %v (backoff=%s failures=%d)", g.name, attemptID, time.Since(start), err, delay, failures)
@@ -854,6 +1001,8 @@ func (g *Group) replenishOnce(instance string, attemptID uint64) {
 	g.conns = append(g.conns, sc)
 	current := len(g.conns)
 	g.connsMu.Unlock()
+	g.signalCapacityChange()
+	g.notifyMaintain()
 
 	g.recordReplenishSuccess()
 	log.Printf("[INFO] upstream %s: replenished pool connection (%d/%d) (sshConn=%d) (attempt=%d)", g.name, current, defaultPoolSize, sc.id, attemptID)
@@ -865,87 +1014,97 @@ func (g *Group) maintain() {
 	defer ticker.Stop()
 
 	g.lastMaintainTime = time.Now()
+	g.maintainOnce(g.lastMaintainTime)
 
 	for {
 		select {
 		case <-g.ctx.Done():
 			return
 		case <-ticker.C:
+		case <-g.maintainCh:
 		}
+		g.maintainOnce(time.Now())
+	}
+}
 
-		now := time.Now()
+func (g *Group) maintainOnce(now time.Time) {
+	// Detect system sleep/wake: if tick interval is much larger than expected,
+	// the system was likely asleep. Reset backoff and clear stale connections.
+	if !g.lastMaintainTime.IsZero() && g.sleepDetectionThreshold > 0 {
+		elapsed := now.Sub(g.lastMaintainTime)
+		if elapsed > g.sleepDetectionThreshold {
+			log.Printf("[INFO] upstream %s: detected system wake after %s, resetting backoff and clearing stale connections",
+				g.name, elapsed)
+			g.resetReplenishBackoff()
+			// Mark all connections as draining and move them out of the pool.
+			// They will be closed gracefully once idle.
+			g.connsMu.Lock()
+			oldConns := g.conns
+			for _, sc := range oldConns {
+				sc.markDraining()
+			}
+			g.conns = nil // Trigger replenish with fresh connections
+			g.connsMu.Unlock()
+			g.signalCapacityChange()
+			g.notifyMaintain()
 
-		// Detect system sleep/wake: if tick interval is much larger than expected,
-		// the system was likely asleep. Reset backoff and clear stale connections.
-		if !g.lastMaintainTime.IsZero() && g.sleepDetectionThreshold > 0 {
-			elapsed := now.Sub(g.lastMaintainTime)
-			if elapsed > g.sleepDetectionThreshold {
-				log.Printf("[INFO] upstream %s: detected system wake after %s, resetting backoff and clearing stale connections",
-					g.name, elapsed)
-				g.resetReplenishBackoff()
-				// Mark all connections as draining and move them out of the pool.
-				// They will be closed gracefully once idle.
-				g.connsMu.Lock()
-				oldConns := g.conns
-				for _, sc := range oldConns {
-					sc.markDraining()
+			// Gracefully close old connections in background once they become idle.
+			go g.closeDrainingConns(oldConns, 30*time.Second)
+		}
+	}
+	g.lastMaintainTime = now
+
+	// Check pool health: remove dead connections and replenish.
+	g.connsMu.Lock()
+	var alive []*sshConn
+	removedAny := false
+	for _, sc := range g.conns {
+		if sc.adapter != nil {
+			select {
+			case <-sc.adapter.Done():
+				// Connection dead, close and skip.
+				log.Printf("[INFO] upstream %s: pool connection closed, removing (sshConn=%d)", g.name, sc.id)
+				if sc.sshClient != nil {
+					sc.sshClient.Close()
 				}
-				g.conns = nil // Trigger replenish with fresh connections
-				g.connsMu.Unlock()
-
-				// Gracefully close old connections in background once they become idle.
-				go g.closeDrainingConns(oldConns, 30*time.Second)
+				sc.adapter.Close()
+				removedAny = true
+			default:
+				alive = append(alive, sc)
 			}
 		}
-		g.lastMaintainTime = now
+	}
+	g.conns = alive
+	currentCount := len(alive)
+	g.connsMu.Unlock()
+	if removedAny {
+		g.signalCapacityChange()
+	}
 
-		// Check pool health: remove dead connections and replenish.
-		g.connsMu.Lock()
-		var alive []*sshConn
-		for _, sc := range g.conns {
-			if sc.adapter != nil {
-				select {
-				case <-sc.adapter.Done():
-					// Connection dead, close and skip.
-					log.Printf("[INFO] upstream %s: pool connection closed, removing (sshConn=%d)", g.name, sc.id)
-					if sc.sshClient != nil {
-						sc.sshClient.Close()
-					}
-					sc.adapter.Close()
-				default:
-					alive = append(alive, sc)
-				}
-			}
+	// Replenish if pool is below target size.
+	if currentCount < defaultPoolSize {
+		needed, wait := g.reserveReplenish(currentCount)
+		if wait > 0 {
+			debugLog("upstream %s: replenish backoff active, next attempt in %s", g.name, wait)
+			return
 		}
-		g.conns = alive
-		currentCount := len(alive)
-		g.connsMu.Unlock()
+		if needed == 0 {
+			return
+		}
 
-		// Replenish if pool is below target size.
-		if currentCount < defaultPoolSize {
-			needed, wait := g.reserveReplenish(currentCount)
-			if wait > 0 {
-				debugLog("upstream %s: replenish backoff active, next attempt in %s", g.name, wait)
-				continue
-			}
-			if needed == 0 {
-				continue
-			}
+		log.Printf("[INFO] upstream %s: pool has %d/%d connections, replenishing %d",
+			g.name, currentCount, defaultPoolSize, needed)
 
-			log.Printf("[INFO] upstream %s: pool has %d/%d connections, replenishing %d",
-				g.name, currentCount, defaultPoolSize, needed)
+		// Reset the per-round rotation flag: only one failed attempt in this round
+		// should trigger instance rotation to avoid pointer wraparound.
+		atomic.StoreInt32(&g.replenishRoundAdvanced, 0)
 
-			// Reset the per-round rotation flag: only one failed attempt in this round
-			// should trigger instance rotation to avoid pointer wraparound.
-			atomic.StoreInt32(&g.replenishRoundAdvanced, 0)
+		// Capture instance once per round so all concurrent attempts use the same target.
+		instance := g.currentInstance()
 
-			// Capture instance once per round so all concurrent attempts use the same target.
-			instance := g.currentInstance()
-
-			for i := 0; i < needed; i++ {
-				attemptID := atomic.AddUint64(&g.replenishAttemptID, 1)
-				go g.replenishOnce(instance, attemptID)
-			}
+		for i := 0; i < needed; i++ {
+			attemptID := atomic.AddUint64(&g.replenishAttemptID, 1)
+			go g.replenishOnce(instance, attemptID)
 		}
 	}
 }
@@ -961,6 +1120,7 @@ func (g *Group) cleanup() {
 		}
 	}
 	g.conns = nil
+	g.signalCapacityChange()
 }
 
 // Close closes all upstream connections.

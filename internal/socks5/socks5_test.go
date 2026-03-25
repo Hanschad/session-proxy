@@ -3,6 +3,7 @@ package socks5
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -284,6 +285,93 @@ func TestHandshakeAuthFailure(t *testing.T) {
 	if err == nil {
 		t.Error("expected handshake to fail with wrong password")
 	}
+}
+
+type stubAcceptListener struct {
+	accept func() (net.Conn, error)
+}
+
+func (l *stubAcceptListener) Accept() (net.Conn, error) { return l.accept() }
+func (l *stubAcceptListener) Close() error              { return nil }
+func (l *stubAcceptListener) Addr() net.Addr            { return stubAddr("stub") }
+
+type stubAddr string
+
+func (a stubAddr) Network() string { return "tcp" }
+func (a stubAddr) String() string  { return string(a) }
+
+type temporaryAcceptError struct{ err error }
+
+func (e temporaryAcceptError) Error() string   { return e.err.Error() }
+func (e temporaryAcceptError) Temporary() bool { return true }
+func (e temporaryAcceptError) Timeout() bool   { return false }
+
+func TestServeRetriesTemporaryAcceptErrors(t *testing.T) {
+	srv := New(&Config{})
+
+	sentinel := errors.New("stop")
+	var mu sync.Mutex
+	accepts := 0
+
+	ln := &stubAcceptListener{
+		accept: func() (net.Conn, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			accepts++
+			switch accepts {
+			case 1:
+				return nil, temporaryAcceptError{err: errors.New("temporary")}
+			default:
+				return nil, sentinel
+			}
+		},
+	}
+
+	err := srv.Serve(ln)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("expected sentinel error, got %v", err)
+	}
+	if accepts != 2 {
+		t.Fatalf("expected Serve to retry after temporary error, got %d accept attempts", accepts)
+	}
+}
+
+func TestResolveMaxConnsDefaultsAndEnv(t *testing.T) {
+	t.Setenv("SESSION_PROXY_SOCKS_MAX_CONNS", "")
+	if got := resolveMaxConns(0); got != defaultMaxConcurrentConns {
+		t.Fatalf("expected default limit %d, got %d", defaultMaxConcurrentConns, got)
+	}
+
+	t.Setenv("SESSION_PROXY_SOCKS_MAX_CONNS", "512")
+	if got := resolveMaxConns(0); got != 512 {
+		t.Fatalf("expected env override 512, got %d", got)
+	}
+
+	t.Setenv("SESSION_PROXY_SOCKS_MAX_CONNS", "0")
+	if got := resolveMaxConns(0); got != 0 {
+		t.Fatalf("expected zero env override to disable limit, got %d", got)
+	}
+
+	if got := resolveMaxConns(128); got != 128 {
+		t.Fatalf("expected explicit config to win, got %d", got)
+	}
+}
+
+func TestTryAcquireConnHonorsLimit(t *testing.T) {
+	srv := New(&Config{MaxConns: 1})
+
+	if !srv.tryAcquireConn() {
+		t.Fatal("expected first acquire to succeed")
+	}
+	if srv.tryAcquireConn() {
+		t.Fatal("expected second acquire to fail at limit")
+	}
+
+	srv.releaseConn()
+	if !srv.tryAcquireConn() {
+		t.Fatal("expected acquire to succeed after release")
+	}
+	srv.releaseConn()
 }
 
 func TestHandshakeNoAuthMethodMismatch(t *testing.T) {

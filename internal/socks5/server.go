@@ -7,6 +7,8 @@ import (
 	"io"
 	"log"
 	"net"
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -17,6 +19,8 @@ import (
 
 var nextConnID uint64
 
+const defaultMaxConcurrentConns = 2048
+
 // AuthConfig holds optional authentication credentials.
 type AuthConfig struct {
 	User string
@@ -25,21 +29,26 @@ type AuthConfig struct {
 
 // Config holds server configuration
 type Config struct {
-	Dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	Auth *AuthConfig // Optional authentication
+	Dial     func(ctx context.Context, network, addr string) (net.Conn, error)
+	Auth     *AuthConfig // Optional authentication
+	MaxConns int
 }
 
 // Server is a SOCKS5 proxy server
 type Server struct {
-	dial func(ctx context.Context, network, addr string) (net.Conn, error)
-	auth *AuthConfig
+	dial       func(ctx context.Context, network, addr string) (net.Conn, error)
+	auth       *AuthConfig
+	maxConns   int
+	connTokens chan struct{}
+	activeConn atomic.Int64
 }
 
 // New creates a new SOCKS5 server
 func New(cfg *Config) *Server {
 	s := &Server{
-		dial: cfg.Dial,
-		auth: cfg.Auth,
+		dial:     cfg.Dial,
+		auth:     cfg.Auth,
+		maxConns: resolveMaxConns(cfg.MaxConns),
 	}
 	if s.dial == nil {
 		s.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -47,18 +56,106 @@ func New(cfg *Config) *Server {
 			return d.DialContext(ctx, network, addr)
 		}
 	}
+	if s.maxConns > 0 {
+		s.connTokens = make(chan struct{}, s.maxConns)
+	}
 	return s
 }
 
 // Serve accepts connections from the listener and handles them
 func (s *Server) Serve(l net.Listener) error {
+	var tempDelay time.Duration
+
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			if isTemporaryAcceptError(err) {
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+					if tempDelay > time.Second {
+						tempDelay = time.Second
+					}
+				}
+				log.Printf("[WARN] socks: temporary accept error: %v (retry in %s)", err, tempDelay)
+				time.Sleep(tempDelay)
+				continue
+			}
 			return err
 		}
-		go s.handleConn(conn)
+		tempDelay = 0
+		if !s.tryAcquireConn() {
+			log.Printf("[WARN] socks: connection limit reached active=%d max=%d remote=%s", s.activeConn.Load(), s.maxConns, conn.RemoteAddr())
+			_ = conn.Close()
+			continue
+		}
+		go func() {
+			defer s.releaseConn()
+			s.handleConn(conn)
+		}()
 	}
+}
+
+func resolveMaxConns(configured int) int {
+	if configured > 0 {
+		return configured
+	}
+
+	if v := os.Getenv("SESSION_PROXY_SOCKS_MAX_CONNS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			log.Printf("[WARN] SESSION_PROXY_SOCKS_MAX_CONNS=%q invalid, using default %d", v, defaultMaxConcurrentConns)
+			return defaultMaxConcurrentConns
+		}
+		if n <= 0 {
+			return 0
+		}
+		return n
+	}
+
+	return defaultMaxConcurrentConns
+}
+
+func (s *Server) tryAcquireConn() bool {
+	if s.connTokens == nil {
+		s.activeConn.Add(1)
+		return true
+	}
+
+	select {
+	case s.connTokens <- struct{}{}:
+		s.activeConn.Add(1)
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) releaseConn() {
+	if s.connTokens != nil {
+		select {
+		case <-s.connTokens:
+		default:
+		}
+	}
+	s.activeConn.Add(-1)
+}
+
+func isTemporaryAcceptError(err error) bool {
+	type temporary interface {
+		Temporary() bool
+	}
+
+	if te, ok := err.(temporary); ok && te.Temporary() {
+		return true
+	}
+
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		return true
+	}
+
+	return false
 }
 
 func (s *Server) handleConn(conn net.Conn) {

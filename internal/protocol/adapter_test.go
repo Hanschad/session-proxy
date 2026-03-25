@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -267,6 +268,36 @@ func TestWaitForHandshake_PrefersCompletedHandshake(t *testing.T) {
 	}
 }
 
+func TestReadDeadlineUsesStreamDeadlineWithoutGoroutineBridge(t *testing.T) {
+	readConn, writeConn := net.Pipe()
+	a := &Adapter{
+		streamReader: readConn,
+		streamWriter: writeConn,
+		done:         make(chan struct{}),
+	}
+	defer a.Close()
+
+	if err := a.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline() error = %v", err)
+	}
+
+	buf := make([]byte, 8)
+	start := time.Now()
+	_, err := a.Read(buf)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	var netErr interface{ Timeout() bool }
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected read deadline to fire promptly, got %s", elapsed)
+	}
+}
+
 func TestHandleHandshakeRequestPayload_WriteFailureClosesAdapter(t *testing.T) {
 	a, cleanup := newBareTestAdapter(t)
 	defer cleanup()
@@ -360,11 +391,11 @@ func newBareTestAdapter(t *testing.T) (*Adapter, func()) {
 		t.Fatalf("Dial websocket: %v", err)
 	}
 
-	reader, writer := io.Pipe()
+	reader, writer := net.Pipe()
 	adapter := &Adapter{
 		conn:                    conn,
-		reader:                  reader,
-		writer:                  writer,
+		streamReader:            reader,
+		streamWriter:            writer,
 		chunkSize:               defaultStreamChunkSize,
 		seenMsgIds:              make(map[uuid.UUID]int64),
 		handshakeDone:           make(chan struct{}),

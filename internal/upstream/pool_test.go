@@ -2,16 +2,233 @@ package upstream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	ssmclient "github.com/hanschad/session-proxy/internal/aws/ssm"
+	"github.com/hanschad/session-proxy/internal/config"
+	"github.com/hanschad/session-proxy/internal/protocol"
 	gossh "golang.org/x/crypto/ssh"
 )
+
+func TestPoolConnectParallelizesUpstreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	slow := &Group{
+		name:      "slow",
+		instances: []string{"i-slow"},
+	}
+	fast := &Group{
+		name:      "fast",
+		instances: []string{"i-fast"},
+	}
+
+	connectDelay := 150 * time.Millisecond
+	started := make(chan string, 2)
+
+	origGroupConnect := groupConnectHook
+	groupConnectHook = func(g *Group, ctx context.Context) error {
+		started <- g.name
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(connectDelay):
+		}
+		g.connsMu.Lock()
+		g.conns = []*sshConn{{id: 1, group: g, adapter: &protocol.Adapter{}}}
+		g.connsMu.Unlock()
+		return nil
+	}
+	defer func() {
+		groupConnectHook = origGroupConnect
+	}()
+
+	p := &Pool{
+		groups: map[string]*Group{
+			"slow": slow,
+			"fast": fast,
+		},
+	}
+
+	start := time.Now()
+	if err := p.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed >= 2*connectDelay {
+		t.Fatalf("expected parallel connect to finish faster than %s, got %s", 2*connectDelay, elapsed)
+	}
+
+	got := map[string]bool{}
+	for i := 0; i < 2; i++ {
+		got[<-started] = true
+	}
+	if !got["slow"] || !got["fast"] {
+		t.Fatalf("expected both groups to start, got %v", got)
+	}
+
+	p.Close()
+}
+
+func TestDialWaitForCapacityWakesOnSignal(t *testing.T) {
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+	}
+
+	sc := &sshConn{
+		id:    1,
+		group: g,
+	}
+	atomic.StoreInt64(&sc.activeChannels, maxChannelsPerConn)
+
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Millisecond)
+	defer cancel()
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		atomic.StoreInt64(&sc.activeChannels, 0)
+		g.signalCapacityChange()
+	}()
+
+	_, err := g.dial(ctx, "tcp", "10.0.0.1:80")
+	if err == nil {
+		t.Fatal("expected dial to fail because ssh client is nil")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected dial wait to wake on capacity signal before context timeout, got %v", err)
+	}
+}
+
+func TestGetSSMClientReusesClientAcrossCallers(t *testing.T) {
+	g := &Group{
+		awsCfg: config.AWSConfig{
+			Profile: "default",
+		},
+	}
+
+	origHook := newSSMClientHook
+	defer func() {
+		newSSMClientHook = origHook
+	}()
+
+	wantClient := &ssmclient.Client{}
+
+	var (
+		mu    sync.Mutex
+		calls int
+	)
+
+	newSSMClientHook = func(ctx context.Context, cfg ssmclient.ClientConfig) (*ssmclient.Client, error) {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		return wantClient, nil
+	}
+
+	const callers = 8
+	var wg sync.WaitGroup
+	results := make(chan *ssmclient.Client, callers)
+	errs := make(chan error, callers)
+
+	for i := 0; i < callers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			client, err := g.getSSMClient(context.Background())
+			if err != nil {
+				errs <- err
+				return
+			}
+			results <- client
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		t.Fatalf("getSSMClient() error = %v", err)
+	}
+
+	for client := range results {
+		if client != wantClient {
+			t.Fatalf("expected shared SSM client %p, got %p", wantClient, client)
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("expected SSM client to be created once, got %d", calls)
+	}
+}
+
+func TestMaintainStartsReplenishImmediately(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := &Group{
+		name:       "test",
+		instances:  []string{"i-test-1"},
+		ctx:        ctx,
+		cancel:     cancel,
+		maintainCh: make(chan struct{}, 1),
+	}
+
+	origHook := groupConnectSingleHook
+	var replenishWG sync.WaitGroup
+	replenishWG.Add(replenishParallelism)
+	defer func() {
+		replenishWG.Wait()
+		groupConnectSingleHook = origHook
+	}()
+
+	started := make(chan struct{}, 1)
+	groupConnectSingleHook = func(g *Group, ctx context.Context, instanceID string) (*sshConn, error) {
+		defer replenishWG.Done()
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		g.maintain()
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("expected maintain to trigger replenish immediately")
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("maintain did not exit after cancel")
+	}
+}
 
 // mockAdapter simulates protocol.Adapter for testing
 type mockAdapter struct {
