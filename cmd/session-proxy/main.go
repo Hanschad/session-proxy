@@ -9,9 +9,11 @@ import (
 	"syscall"
 
 	"github.com/hanschad/session-proxy/internal/config"
+	"github.com/hanschad/session-proxy/internal/diag"
 	"github.com/hanschad/session-proxy/internal/protocol"
 	"github.com/hanschad/session-proxy/internal/proxy"
 	"github.com/hanschad/session-proxy/internal/router"
+	"github.com/hanschad/session-proxy/internal/socks5"
 	"github.com/hanschad/session-proxy/internal/ssh"
 	"github.com/hanschad/session-proxy/internal/upstream"
 )
@@ -38,6 +40,7 @@ func main() {
 
 	if opt.IsDebug() {
 		protocol.DebugMode = true
+		socks5.DebugMode = true
 		ssh.DebugMode = true
 		log.Println("[INFO] Debug mode enabled")
 	}
@@ -49,6 +52,7 @@ func main() {
 
 	if opt.ShowConfig {
 		fmt.Printf("Listen: %s\n", cfg.Listen)
+		fmt.Printf("DiagListen: %s\n", cfg.DiagListen)
 		fmt.Printf("Upstreams: %d\n", len(cfg.Upstreams))
 		for name, up := range cfg.Upstreams {
 			fmt.Printf("  - %s: %v\n", name, up.Instances)
@@ -82,18 +86,24 @@ func run(ctx context.Context, cfg *config.Config, opt *config.Options) {
 	// Build upstream pool
 	pool := upstream.NewPool(cfg)
 
+	// Create server
+	server, err := proxy.NewRoutingServer(cfg, rt, pool)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
+
+	if cfg.DiagListen != "" {
+		if err := diag.Start(ctx, cfg.DiagListen, version, server, pool); err != nil {
+			log.Fatalf("Failed to start diagnostics server: %v", err)
+		}
+	}
+
 	// Pre-establish connections
 	log.Printf("[INFO] Connecting to %d upstreams...", len(cfg.Upstreams))
 	if err := pool.Connect(ctx); err != nil {
 		log.Fatalf("Failed to connect upstreams: %v", err)
 	}
 	log.Println("[INFO] All upstreams connected")
-
-	// Create server
-	server, err := proxy.NewRoutingServer(cfg, rt, pool)
-	if err != nil {
-		log.Fatalf("Failed to create server: %v", err)
-	}
 
 	// Start config watcher for hot reload
 	if err := opt.Watch(ctx, func(newCfg *config.Config, err error) {

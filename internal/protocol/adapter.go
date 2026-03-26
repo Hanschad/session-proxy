@@ -110,6 +110,9 @@ type Adapter struct {
 	writeMu sync.Mutex
 	seqNum  int64
 
+	writeDeadlineMu sync.RWMutex
+	writeDeadline   time.Time
+
 	chunkSize int
 
 	pauseMu     sync.Mutex
@@ -488,6 +491,13 @@ func (a *Adapter) addOutgoing(seq int64, msgID uuid.UUID, data []byte) error {
 		a.outgoingCond = sync.NewCond(&a.outgoingMu)
 	}
 
+	var deadlineTimer *time.Timer
+	defer func() {
+		if deadlineTimer != nil {
+			deadlineTimer.Stop()
+		}
+	}()
+
 	logged := false
 	for a.outgoingBytes+need > a.maxOutgoingUnackedBytes {
 		if a.outgoingClosed {
@@ -496,6 +506,15 @@ func (a *Adapter) addOutgoing(seq int64, msgID uuid.UUID, data []byte) error {
 		if !logged {
 			debugLog("Outgoing buffer full (bytes=%d need=%d limit=%d), backpressuring", a.outgoingBytes, need, a.maxOutgoingUnackedBytes)
 			logged = true
+		}
+		if err := a.ensureWriteDeadlineWake(&deadlineTimer, func() {
+			a.outgoingMu.Lock()
+			if a.outgoingCond != nil {
+				a.outgoingCond.Broadcast()
+			}
+			a.outgoingMu.Unlock()
+		}); err != nil {
+			return err
 		}
 		a.outgoingCond.Wait()
 	}
@@ -811,8 +830,12 @@ func (a *Adapter) writeRaw(data []byte, msgType string, payloadType uint32) erro
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 
+	if a.conn == nil {
+		return io.ErrClosedPipe
+	}
+
 	// SSM uses BinaryMessage for frames
-	_ = a.conn.SetWriteDeadline(time.Now().Add(writeWait))
+	_ = a.conn.SetWriteDeadline(a.effectiveWriteDeadline())
 	err := a.conn.WriteMessage(websocket.BinaryMessage, data)
 	if err != nil {
 		debugLog("WebSocket WriteMessage FAILED: %v", err)
@@ -984,16 +1007,13 @@ func (a *Adapter) waitForPublication() error {
 		}
 		if ch == nil {
 			// Should not happen, but avoid a deadlock.
-			time.Sleep(10 * time.Millisecond)
+			if err := a.sleepWithWriteDeadline(10 * time.Millisecond); err != nil {
+				return err
+			}
 			continue
 		}
-
-		select {
-		case <-ch:
-			// resumed
-			continue
-		case <-a.done:
-			return io.ErrClosedPipe
+		if err := a.waitWithWriteDeadline(ch); err != nil {
+			return err
 		}
 	}
 }
@@ -1104,7 +1124,7 @@ func (a *Adapter) SetDeadline(t time.Time) error {
 			return err
 		}
 	}
-	return a.conn.SetWriteDeadline(t)
+	return a.SetWriteDeadline(t)
 }
 
 // SetReadDeadline implements net.Conn
@@ -1117,7 +1137,138 @@ func (a *Adapter) SetReadDeadline(t time.Time) error {
 
 // SetWriteDeadline implements net.Conn
 func (a *Adapter) SetWriteDeadline(t time.Time) error {
+	a.writeDeadlineMu.Lock()
+	a.writeDeadline = t
+	a.writeDeadlineMu.Unlock()
+
+	a.outgoingMu.Lock()
+	if a.outgoingCond != nil {
+		a.outgoingCond.Broadcast()
+	}
+	a.outgoingMu.Unlock()
+
+	if a.conn == nil {
+		return nil
+	}
 	return a.conn.SetWriteDeadline(t)
+}
+
+func (a *Adapter) currentWriteDeadline() time.Time {
+	a.writeDeadlineMu.RLock()
+	defer a.writeDeadlineMu.RUnlock()
+	return a.writeDeadline
+}
+
+func (a *Adapter) writeDeadlineExceeded() bool {
+	deadline := a.currentWriteDeadline()
+	return !deadline.IsZero() && !time.Now().Before(deadline)
+}
+
+func (a *Adapter) writeDeadlineWait() (time.Duration, bool) {
+	deadline := a.currentWriteDeadline()
+	if deadline.IsZero() {
+		return 0, false
+	}
+
+	wait := time.Until(deadline)
+	if wait <= 0 {
+		return 0, false
+	}
+
+	return wait, true
+}
+
+func (a *Adapter) effectiveWriteDeadline() time.Time {
+	deadline := a.currentWriteDeadline()
+	if deadline.IsZero() {
+		return time.Now().Add(writeWait)
+	}
+	internal := time.Now().Add(writeWait)
+	if internal.Before(deadline) {
+		return internal
+	}
+	return deadline
+}
+
+func (a *Adapter) ensureWriteDeadlineWake(timer **time.Timer, wake func()) error {
+	if a.writeDeadlineExceeded() {
+		return timeoutError{}
+	}
+	if *timer != nil {
+		return nil
+	}
+
+	wait, ok := a.writeDeadlineWait()
+	if !ok {
+		if a.writeDeadlineExceeded() {
+			return timeoutError{}
+		}
+		return nil
+	}
+
+	*timer = time.AfterFunc(wait, wake)
+	return nil
+}
+
+func (a *Adapter) sleepWithWriteDeadline(d time.Duration) error {
+	if a.writeDeadlineExceeded() {
+		return timeoutError{}
+	}
+
+	wait := d
+	if deadlineWait, ok := a.writeDeadlineWait(); ok {
+		wait = minDuration(wait, deadlineWait)
+	}
+	if wait <= 0 {
+		return timeoutError{}
+	}
+
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+	select {
+	case <-timer.C:
+		if a.writeDeadlineExceeded() {
+			return timeoutError{}
+		}
+		return nil
+	case <-a.done:
+		return io.ErrClosedPipe
+	}
+}
+
+func (a *Adapter) waitWithWriteDeadline(ch <-chan struct{}) error {
+	if a.writeDeadlineExceeded() {
+		return timeoutError{}
+	}
+
+	if wait, ok := a.writeDeadlineWait(); ok {
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+
+		select {
+		case <-ch:
+			return nil
+		case <-a.done:
+			return io.ErrClosedPipe
+		case <-timer.C:
+			return timeoutError{}
+		}
+	}
+
+	select {
+	case <-ch:
+		return nil
+	case <-a.done:
+		return io.ErrClosedPipe
+	}
+}
+
+func minDuration(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // handleDataMessage processes data messages in sequence order.

@@ -368,6 +368,65 @@ func TestAddOutgoing_ClosedAdapter(t *testing.T) {
 	}
 }
 
+func TestWrite_WriteDeadlineDuringPause(t *testing.T) {
+	a := &Adapter{
+		done:     make(chan struct{}),
+		pauseCh:  make(chan struct{}),
+		paused:   true,
+		outgoing: make(map[int64]*outgoingMessage),
+	}
+
+	if err := a.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline() error = %v", err)
+	}
+
+	start := time.Now()
+	_, err := a.Write([]byte("hello"))
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	var netErr interface{ Timeout() bool }
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected write deadline to fire promptly, got %s", elapsed)
+	}
+}
+
+func TestAddOutgoing_WriteDeadlineDuringBackpressure(t *testing.T) {
+	a := &Adapter{
+		done:                    make(chan struct{}),
+		outgoing:                make(map[int64]*outgoingMessage),
+		outgoingOldestSeq:       0,
+		maxOutgoingUnackedBytes: 100,
+	}
+	a.outgoingCond = sync.NewCond(&a.outgoingMu)
+	a.outgoing[0] = &outgoingMessage{msgID: uuid.New(), data: make([]byte, 100), lastSent: time.Now()}
+	a.outgoingBytes = 100
+
+	if err := a.SetWriteDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline() error = %v", err)
+	}
+
+	start := time.Now()
+	err := a.addOutgoing(1, uuid.New(), make([]byte, 10))
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+
+	var netErr interface{ Timeout() bool }
+	if !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("expected timeout error, got %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected addOutgoing deadline to fire promptly, got %s", elapsed)
+	}
+}
+
 func newBareTestAdapter(t *testing.T) (*Adapter, func()) {
 	t.Helper()
 

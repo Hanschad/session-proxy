@@ -158,6 +158,42 @@ upstreams:
 `,
 			wantErr: `region is required when using access_key/secret_key`,
 		},
+		{
+			name: "partial inline creds missing secret",
+			content: `
+upstreams:
+  dev:
+    aws:
+      access_key: AKIA123
+    instances: [i-1]
+`,
+			wantErr: `access_key and secret_key must be provided together`,
+		},
+		{
+			name: "partial inline creds missing access key",
+			content: `
+upstreams:
+  dev:
+    aws:
+      secret_key: secret
+    instances: [i-1]
+`,
+			wantErr: `access_key and secret_key must be provided together`,
+		},
+		{
+			name: "profile and inline creds are mutually exclusive",
+			content: `
+upstreams:
+  dev:
+    aws:
+      profile: prod
+      access_key: AKIA123
+      secret_key: secret
+      region: us-east-1
+    instances: [i-1]
+`,
+			wantErr: `profile and access_key/secret_key are mutually exclusive`,
+		},
 	}
 
 	for _, tt := range tests {

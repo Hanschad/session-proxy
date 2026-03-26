@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -18,8 +19,16 @@ import (
 )
 
 var nextConnID uint64
+var DebugMode bool
 
 const defaultMaxConcurrentConns = 2048
+const clientCloseProbeInterval = 200 * time.Millisecond
+
+func debugLog(format string, args ...interface{}) {
+	if DebugMode {
+		log.Printf("[DEBUG] "+format, args...)
+	}
+}
 
 // AuthConfig holds optional authentication credentials.
 type AuthConfig struct {
@@ -34,6 +43,20 @@ type Config struct {
 	MaxConns int
 }
 
+// Stats captures lightweight SOCKS server counters for diagnostics.
+type Stats struct {
+	ActiveConns           int64  `json:"active_conns"`
+	MaxConns              int    `json:"max_conns"`
+	AcceptedTotal         uint64 `json:"accepted_total"`
+	ConnLimitRejectsTotal uint64 `json:"conn_limit_rejects_total"`
+	HandshakeErrorsTotal  uint64 `json:"handshake_errors_total"`
+	RequestErrorsTotal    uint64 `json:"request_errors_total"`
+	DialErrorsTotal       uint64 `json:"dial_errors_total"`
+	ConnectSuccessTotal   uint64 `json:"connect_success_total"`
+	RelayClosedTotal      uint64 `json:"relay_closed_total"`
+	UnsupportedCmdTotal   uint64 `json:"unsupported_cmd_total"`
+}
+
 // Server is a SOCKS5 proxy server
 type Server struct {
 	dial       func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -41,6 +64,15 @@ type Server struct {
 	maxConns   int
 	connTokens chan struct{}
 	activeConn atomic.Int64
+
+	acceptedTotal         atomic.Uint64
+	connLimitRejectsTotal atomic.Uint64
+	handshakeErrorsTotal  atomic.Uint64
+	requestErrorsTotal    atomic.Uint64
+	dialErrorsTotal       atomic.Uint64
+	connectSuccessTotal   atomic.Uint64
+	relayClosedTotal      atomic.Uint64
+	unsupportedCmdTotal   atomic.Uint64
 }
 
 // New creates a new SOCKS5 server
@@ -64,11 +96,24 @@ func New(cfg *Config) *Server {
 
 // Serve accepts connections from the listener and handles them
 func (s *Server) Serve(l net.Listener) error {
+	return s.ServeContext(context.Background(), l)
+}
+
+// ServeContext accepts connections from the listener and handles them until
+// the listener fails or ctx is canceled.
+func (s *Server) ServeContext(ctx context.Context, l net.Listener) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var tempDelay time.Duration
 
 	for {
 		conn, err := l.Accept()
 		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			if isTemporaryAcceptError(err) {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
@@ -84,16 +129,33 @@ func (s *Server) Serve(l net.Listener) error {
 			}
 			return err
 		}
+		s.acceptedTotal.Add(1)
 		tempDelay = 0
 		if !s.tryAcquireConn() {
+			s.connLimitRejectsTotal.Add(1)
 			log.Printf("[WARN] socks: connection limit reached active=%d max=%d remote=%s", s.activeConn.Load(), s.maxConns, conn.RemoteAddr())
 			_ = conn.Close()
 			continue
 		}
 		go func() {
 			defer s.releaseConn()
-			s.handleConn(conn)
+			s.handleConn(ctx, conn)
 		}()
+	}
+}
+
+func (s *Server) Stats() Stats {
+	return Stats{
+		ActiveConns:           s.activeConn.Load(),
+		MaxConns:              s.maxConns,
+		AcceptedTotal:         s.acceptedTotal.Load(),
+		ConnLimitRejectsTotal: s.connLimitRejectsTotal.Load(),
+		HandshakeErrorsTotal:  s.handshakeErrorsTotal.Load(),
+		RequestErrorsTotal:    s.requestErrorsTotal.Load(),
+		DialErrorsTotal:       s.dialErrorsTotal.Load(),
+		ConnectSuccessTotal:   s.connectSuccessTotal.Load(),
+		RelayClosedTotal:      s.relayClosedTotal.Load(),
+		UnsupportedCmdTotal:   s.unsupportedCmdTotal.Load(),
 	}
 }
 
@@ -158,12 +220,12 @@ func isTemporaryAcceptError(err error) bool {
 	return false
 }
 
-func (s *Server) handleConn(conn net.Conn) {
+func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 
 	connID := atomic.AddUint64(&nextConnID, 1)
 	remoteAddr := conn.RemoteAddr().String()
-	log.Printf("[INFO] socks: accepted conn=%d remote=%s", connID, remoteAddr)
+	debugLog("socks: accepted conn=%d remote=%s", connID, remoteAddr)
 
 	// Apply short deadlines for initial negotiation to avoid hanging goroutines.
 	// After CONNECT succeeds, we clear deadlines for long-lived streams.
@@ -174,6 +236,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	if err := s.handshake(conn); err != nil {
+		s.handshakeErrorsTotal.Add(1)
 		log.Printf("[ERROR] socks: handshake failed: conn=%d remote=%s err=%v", connID, remoteAddr, err)
 		return
 	}
@@ -181,17 +244,20 @@ func (s *Server) handleConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 	req, err := s.readRequest(conn)
 	if err != nil {
+		s.requestErrorsTotal.Add(1)
 		log.Printf("[ERROR] socks: read request failed: conn=%d remote=%s err=%v", connID, remoteAddr, err)
 		return
 	}
 
 	// Clear deadlines after negotiation.
 	_ = conn.SetDeadline(time.Time{})
+	clientConn := newBufferedConn(conn)
 
 	switch req.Cmd {
 	case CmdConnect:
-		s.handleConnect(conn, req, connID, remoteAddr)
+		s.handleConnect(ctx, clientConn, req, connID, remoteAddr)
 	default:
+		s.unsupportedCmdTotal.Add(1)
 		s.sendReply(conn, RepCommandNotSupported, nil)
 		log.Printf("[WARN] socks: unsupported command conn=%d cmd=%d remote=%s", connID, req.Cmd, remoteAddr)
 	}
@@ -308,7 +374,7 @@ func (s *Server) authenticateUserPass(conn net.Conn) error {
 
 	// Success
 	s.sendAuthReply(conn, 0x00)
-	log.Printf("[INFO] socks: authenticated user %q (remote=%s)", string(username), conn.RemoteAddr())
+	debugLog("socks: authenticated user %q (remote=%s)", string(username), conn.RemoteAddr())
 	return nil
 }
 
@@ -352,15 +418,17 @@ func (s *Server) readRequest(conn net.Conn) (*Request, error) {
 }
 
 // handleConnect handles CONNECT command
-func (s *Server) handleConnect(conn net.Conn, req *Request, connID uint64, clientRemoteAddr string) {
+func (s *Server) handleConnect(baseCtx context.Context, conn net.Conn, req *Request, connID uint64, clientRemoteAddr string) {
 	dialStart := time.Now()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel, stopWatch := s.newDialContext(baseCtx, conn, 30*time.Second)
 	ctx = trace.WithConnID(ctx, connID)
 	defer cancel()
 	target := req.Addr.String()
 
 	remote, err := s.dial(ctx, "tcp", target)
+	stopWatch()
 	if err != nil {
+		s.dialErrorsTotal.Add(1)
 		log.Printf("[ERROR] socks: dial failed: conn=%d target=%s remote=%s dur=%s err=%q",
 			connID, target, clientRemoteAddr, time.Since(dialStart), err)
 		s.sendReplyError(conn, err)
@@ -375,14 +443,15 @@ func (s *Server) handleConnect(conn net.Conn, req *Request, connID uint64, clien
 		return
 	}
 
-	log.Printf("[INFO] socks: connected conn=%d target=%s remote=%s dial=%s",
+	s.connectSuccessTotal.Add(1)
+	debugLog("socks: connected conn=%d target=%s remote=%s dial=%s",
 		connID, target, clientRemoteAddr, time.Since(dialStart))
 
 	s.relay(connID, target, clientRemoteAddr, conn, remote)
 }
 
 // relay copies data between two connections.
-// It logs per-connection transfer stats to aid debugging (e.g. large image uploads).
+// Per-connection transfer stats stay behind debug logging to keep the hot path cheap.
 func (s *Server) relay(connID uint64, target, clientRemoteAddr string, client, remote net.Conn) {
 	start := time.Now()
 
@@ -419,8 +488,112 @@ func (s *Server) relay(connID uint64, target, clientRemoteAddr string, client, r
 
 	wg.Wait()
 
-	log.Printf("[INFO] socks: closed conn=%d target=%s remote=%s dur=%s up_bytes=%d down_bytes=%d up_err=%v down_err=%v",
+	debugLog("socks: closed conn=%d target=%s remote=%s dur=%s up_bytes=%d down_bytes=%d up_err=%v down_err=%v",
 		connID, target, clientRemoteAddr, time.Since(start), c2r.n, r2c.n, c2r.err, r2c.err)
+	s.relayClosedTotal.Add(1)
+}
+
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+func newBufferedConn(conn net.Conn) *bufferedConn {
+	return &bufferedConn{
+		Conn:   conn,
+		reader: bufio.NewReader(conn),
+	}
+}
+
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *bufferedConn) Peek(n int) ([]byte, error) {
+	return c.reader.Peek(n)
+}
+
+func (s *Server) newDialContext(baseCtx context.Context, conn net.Conn, timeout time.Duration) (context.Context, context.CancelFunc, context.CancelFunc) {
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	stopWatch := func() {}
+
+	peekConn, ok := conn.(interface {
+		net.Conn
+		Peek(int) ([]byte, error)
+	})
+	if ok {
+		watchCtx, watchCancel := context.WithCancel(ctx)
+		watchDone := make(chan struct{})
+		stopWatch = func() {
+			watchCancel()
+			_ = peekConn.SetReadDeadline(time.Now())
+			<-watchDone
+		}
+		go func() {
+			defer close(watchDone)
+			watchClientDisconnect(watchCtx, peekConn, cancel)
+		}()
+	}
+
+	return ctx, cancel, stopWatch
+}
+
+func watchClientDisconnect(ctx context.Context, conn interface {
+	net.Conn
+	Peek(int) ([]byte, error)
+}, cancel context.CancelFunc) {
+	defer func() {
+		_ = conn.SetReadDeadline(time.Time{})
+	}()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if err := conn.SetReadDeadline(time.Now().Add(clientCloseProbeInterval)); err != nil {
+			return
+		}
+
+		_, err := conn.Peek(1)
+		if err == nil {
+			// Data arrived before CONNECT completed. Keep it buffered for relay and stop probing.
+			return
+		}
+
+		var netErr net.Error
+		if errors.As(err, &netErr) && netErr.Timeout() {
+			continue
+		}
+
+		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || isConnClosedError(err) {
+			cancel()
+		}
+		return
+	}
+}
+
+func isConnClosedError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var syscallErr syscall.Errno
+	if errors.As(err, &syscallErr) {
+		switch syscallErr {
+		case syscall.ECONNRESET, syscall.EPIPE, syscall.ENOTCONN:
+			return true
+		}
+	}
+
+	msg := err.Error()
+	return msg == "use of closed network connection"
 }
 
 // sendReply sends a SOCKS5 reply

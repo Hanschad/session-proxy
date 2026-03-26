@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/spf13/pflag"
@@ -27,9 +28,11 @@ type Options struct {
 	Debug       bool   `yaml:"-"`
 
 	// Core config (CLI + file + env)
-	Listen  string      `yaml:"listen" mapstructure:"listen"`
-	Auth    *AuthConfig `yaml:"auth" mapstructure:"auth"`
-	Default string      `yaml:"default" mapstructure:"default"`
+	Listen                  string        `yaml:"listen" mapstructure:"listen"`
+	DiagListen              string        `yaml:"diag_listen" mapstructure:"diag_listen"`
+	Auth                    *AuthConfig   `yaml:"auth" mapstructure:"auth"`
+	Default                 string        `yaml:"default" mapstructure:"default"`
+	SleepDetectionThreshold time.Duration `yaml:"sleep_detection_threshold" mapstructure:"sleep_detection_threshold"`
 
 	// Upstreams and routes are complex, only from file
 	Upstreams map[string]*Upstream `yaml:"upstreams" mapstructure:"upstreams"`
@@ -59,6 +62,7 @@ func New() *Options {
 
 	// Core config with defaults
 	opt.flags.StringVar(&opt.Listen, "listen", "127.0.0.1:28881", "SOCKS5 listen address")
+	opt.flags.StringVar(&opt.DiagListen, "diag-listen", "", "Optional diagnostics listen address (healthz, pprof, state)")
 	opt.flags.StringVar(&opt.Default, "default", "", "Default upstream name")
 
 	// Auth (simplified for CLI)
@@ -92,6 +96,9 @@ func (opt *Options) Parse() error {
 	opt.viper.AutomaticEnv()
 	opt.viper.SetEnvPrefix("SESSION_PROXY")
 	opt.viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_", ".", "_"))
+	if err := opt.bindEnvKeys(); err != nil {
+		return err
+	}
 
 	// Load config file if specified or search in default locations
 	if opt.ConfigFile != "" {
@@ -124,7 +131,7 @@ func (opt *Options) Parse() error {
 	}
 
 	// Workaround: viper doesn't treat env vars same as config
-	for _, key := range opt.viper.AllKeys() {
+	for _, key := range opt.rehydrateKeys() {
 		val := opt.viper.Get(key)
 		opt.viper.Set(key, val)
 	}
@@ -134,14 +141,18 @@ func (opt *Options) Parse() error {
 		return fmt.Errorf("unmarshal config: %w", err)
 	}
 
-	// Handle auth from CLI flags
+	opt.applyAuthOverrides()
+	opt.captureConfigFileUsed()
+
+	return nil
+}
+
+func (opt *Options) applyAuthOverrides() {
 	authUser := opt.viper.GetString("auth-user")
 	authPass := opt.viper.GetString("auth-pass")
 	if authUser != "" && authPass != "" {
 		opt.Auth = &AuthConfig{User: authUser, Pass: authPass}
 	}
-
-	return nil
 }
 
 // ToConfig converts Options to the Config struct used by the application.
@@ -152,11 +163,13 @@ func (opt *Options) ToConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Listen:    opt.Listen,
-		Auth:      opt.Auth,
-		Upstreams: opt.Upstreams,
-		Routes:    opt.Routes,
-		Default:   opt.Default,
+		Listen:                  opt.Listen,
+		DiagListen:              opt.DiagListen,
+		Auth:                    opt.Auth,
+		Upstreams:               opt.Upstreams,
+		Routes:                  opt.Routes,
+		Default:                 opt.Default,
+		SleepDetectionThreshold: opt.SleepDetectionThreshold,
 	}
 
 	if err := cfg.validate(); err != nil {
@@ -173,8 +186,10 @@ func (opt *Options) toLegacyConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
-		Listen: opt.Listen,
-		Auth:   opt.Auth,
+		Listen:                  opt.Listen,
+		DiagListen:              opt.DiagListen,
+		Auth:                    opt.Auth,
+		SleepDetectionThreshold: opt.SleepDetectionThreshold,
 		Upstreams: map[string]*Upstream{
 			"default": {
 				SSH: SSHConfig{
@@ -198,6 +213,58 @@ func (opt *Options) toLegacyConfig() (*Config, error) {
 	return cfg, nil
 }
 
+func (opt *Options) bindEnvKeys() error {
+	for _, key := range envOnlyKeys {
+		if err := opt.viper.BindEnv(key); err != nil {
+			return fmt.Errorf("bind env %q: %w", key, err)
+		}
+	}
+
+	return nil
+}
+
+func (opt *Options) rehydrateKeys() []string {
+	seen := make(map[string]struct{}, len(opt.viper.AllKeys())+len(envOnlyKeys))
+	keys := make([]string, 0, len(opt.viper.AllKeys())+len(envOnlyKeys))
+
+	for _, key := range opt.viper.AllKeys() {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	for _, key := range envOnlyKeys {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+
+	return keys
+}
+
+func (opt *Options) captureConfigFileUsed() {
+	used := opt.viper.ConfigFileUsed()
+	if used == "" {
+		return
+	}
+
+	abs, err := filepath.Abs(used)
+	if err != nil {
+		opt.ConfigFile = used
+		return
+	}
+
+	opt.ConfigFile = abs
+}
+
+var envOnlyKeys = []string{
+	"sleep_detection_threshold",
+}
+
 // PrintUsage prints the usage help.
 func (opt *Options) PrintUsage() {
 	fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
@@ -214,8 +281,7 @@ func (opt *Options) FlagUsages() string {
 // Only routes and default can be hot-reloaded; upstream changes require restart.
 func (opt *Options) Watch(ctx context.Context, onChange func(*Config, error)) error {
 	if opt.ConfigFile == "" {
-		// Try to get config file from viper
-		opt.ConfigFile = opt.viper.ConfigFileUsed()
+		opt.captureConfigFileUsed()
 	}
 	if opt.ConfigFile == "" {
 		return fmt.Errorf("no config file to watch")
@@ -273,18 +339,12 @@ func (opt *Options) Watch(ctx context.Context, onChange func(*Config, error)) er
 
 // reload reloads the config file and returns the new Config.
 func (opt *Options) reload() (*Config, error) {
-	if err := opt.viper.ReadInConfig(); err != nil {
+	// Re-parse from a fresh Options instance so env/file/flag precedence matches
+	// startup behavior and old viper.Set values cannot leak into reloads.
+	newOpt := New()
+	newOpt.ConfigFile = opt.ConfigFile
+	if err := newOpt.Parse(); err != nil {
 		return nil, fmt.Errorf("reload config: %w", err)
-	}
-
-	// Create a new Options for the reload to avoid mutating current state
-	newOpt := &Options{
-		flags: opt.flags,
-		viper: opt.viper,
-	}
-
-	if err := opt.viper.Unmarshal(newOpt); err != nil {
-		return nil, fmt.Errorf("unmarshal config: %w", err)
 	}
 
 	// Validate upstreams haven't changed (not hot-reloadable)

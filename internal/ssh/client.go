@@ -7,12 +7,10 @@ import (
 	"os"
 	"os/user"
 	"strings"
-	"syscall"
 	"time"
 
 	sshlib "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
-	"golang.org/x/term"
 )
 
 var DebugMode bool
@@ -95,24 +93,8 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 		debugLog("SSH Private Key: no key path configured")
 	}
 
-	interactiveAuth := false
 	if len(authMethods) == 0 {
-		interactiveAuth = true
-		// Fallback to interactive password
-		authMethods = append(authMethods, sshlib.PasswordCallback(promptForPassword))
-		authMethods = append(authMethods, sshlib.KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) (answers []string, err error) {
-			// Simple fallback for keyboard interactive that ignores name/instruction and just asks for answers (usually password)
-			for _, q := range questions {
-				fmt.Printf("%s", q)
-				pass, err := term.ReadPassword(int(syscall.Stdin))
-				fmt.Println()
-				if err != nil {
-					return nil, err
-				}
-				answers = append(answers, string(pass))
-			}
-			return answers, nil
-		}))
+		return nil, fmt.Errorf("no non-interactive SSH authentication available: configure SSH_AUTH_SOCK or ssh.key")
 	}
 
 	// WARNING: InsecureIgnoreHostKey accepts any host key.
@@ -128,16 +110,8 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 	// the actual connection is already established via 'conn'.
 	//
 	// Important: for SSH-over-SSM, the underlying transport can become half-open and cause
-	// NewClientConn to block indefinitely. For non-interactive auth, enforce a hard timeout
-	// and close the connection to trigger an upstream reconnect.
-	if interactiveAuth {
-		c, chans, reqs, err := sshlib.NewClientConn(conn, "ssm-target", clientConfig)
-		if err != nil {
-			return nil, fmt.Errorf("ssh handshake failed: %w", err)
-		}
-		return sshlib.NewClient(c, chans, reqs), nil
-	}
-
+	// NewClientConn to block indefinitely. Enforce a hard timeout and close the
+	// connection to trigger an upstream reconnect.
 	const handshakeTimeout = 30 * time.Second
 	type result struct {
 		c     sshlib.Conn
@@ -165,14 +139,4 @@ func Connect(conn net.Conn, cfg Config) (*sshlib.Client, error) {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ssh handshake timeout after %s", handshakeTimeout)
 	}
-}
-
-func promptForPassword() (string, error) {
-	fmt.Print("SSH Password: ")
-	bytePassword, err := term.ReadPassword(int(syscall.Stdin))
-	fmt.Println() // Newline after input
-	if err != nil {
-		return "", err
-	}
-	return string(bytePassword), nil
 }

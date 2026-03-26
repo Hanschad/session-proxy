@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"net"
 	"testing"
 )
 
@@ -36,16 +37,38 @@ func TestConfigWithValues(t *testing.T) {
 // should be added when an SSH test server is available.
 
 func TestConnectWithInvalidKey(t *testing.T) {
-	// Create a mock conn that will fail
-	// This tests the error path when reading a non-existent key file
+	t.Setenv("SSH_AUTH_SOCK", "")
+
 	cfg := Config{
 		User:           "testuser",
 		PrivateKeyPath: "/nonexistent/path/to/key",
 	}
 
-	// We can't call Connect without a real net.Conn, but we can verify
-	// the Config struct handles the path correctly
-	if cfg.PrivateKeyPath != "/nonexistent/path/to/key" {
-		t.Error("PrivateKeyPath not set correctly")
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	_, err := Connect(client, cfg)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() != "failed to read private key: open /nonexistent/path/to/key: no such file or directory" {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestConnectFailsFastWithoutNonInteractiveAuth(t *testing.T) {
+	t.Setenv("SSH_AUTH_SOCK", "")
+
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+
+	_, err := Connect(client, Config{User: "testuser"})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if err.Error() != "no non-interactive SSH authentication available: configure SSH_AUTH_SOCK or ssh.key" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

@@ -11,11 +11,12 @@ import (
 
 // Config is the root configuration structure.
 type Config struct {
-	Listen    string               `mapstructure:"listen"`
-	Auth      *AuthConfig          `mapstructure:"auth"`
-	Upstreams map[string]*Upstream `mapstructure:"upstreams"`
-	Routes    []Route              `mapstructure:"routes"`
-	Default   string               `mapstructure:"default"`
+	Listen     string               `mapstructure:"listen"`
+	DiagListen string               `mapstructure:"diag_listen"`
+	Auth       *AuthConfig          `mapstructure:"auth"`
+	Upstreams  map[string]*Upstream `mapstructure:"upstreams"`
+	Routes     []Route              `mapstructure:"routes"`
+	Default    string               `mapstructure:"default"`
 
 	// SleepDetectionThreshold is the duration beyond which we consider the system
 	// to have been asleep (e.g., laptop lid closed). When detected, connections
@@ -120,17 +121,8 @@ func (c *Config) validate() error {
 			up.SSH.User = "root" // Default SSH user
 		}
 
-		// Validate AWS config: either profile OR (region + ak/sk)
-		hasProfile := up.AWS.Profile != ""
-		hasInlineCreds := up.AWS.AccessKey != "" && up.AWS.SecretKey != ""
-
-		if !hasProfile && !hasInlineCreds {
-			// Default to "default" profile
-			up.AWS.Profile = "default"
-		}
-
-		if hasInlineCreds && up.AWS.Region == "" {
-			return fmt.Errorf("upstream %q: region is required when using access_key/secret_key", name)
+		if err := validateAWSConfig(name, &up.AWS); err != nil {
+			return err
 		}
 	}
 
@@ -159,6 +151,30 @@ func (c *Config) validate() error {
 
 	if c.SleepDetectionThreshold <= 0 {
 		c.SleepDetectionThreshold = 1 * time.Minute
+	}
+
+	return nil
+}
+
+func validateAWSConfig(name string, aws *AWSConfig) error {
+	hasProfile := aws.Profile != ""
+	hasAccessKey := aws.AccessKey != ""
+	hasSecretKey := aws.SecretKey != ""
+
+	if hasAccessKey != hasSecretKey {
+		return fmt.Errorf("upstream %q: access_key and secret_key must be provided together", name)
+	}
+
+	if hasProfile && hasAccessKey {
+		return fmt.Errorf("upstream %q: profile and access_key/secret_key are mutually exclusive", name)
+	}
+
+	if hasAccessKey && aws.Region == "" {
+		return fmt.Errorf("upstream %q: region is required when using access_key/secret_key", name)
+	}
+
+	if !hasProfile && !hasAccessKey {
+		aws.Profile = "default"
 	}
 
 	return nil

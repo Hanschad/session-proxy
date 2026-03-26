@@ -40,10 +40,59 @@ var groupConnectSingleHook = func(g *Group, ctx context.Context, instanceID stri
 	return g.connectSingle(ctx, instanceID)
 }
 
+var sshConnDialHook = func(sc *sshConn, network, addr string) (net.Conn, error) {
+	return sc.sshClient.Dial(network, addr)
+}
+
 // Pool manages multiple upstream connections.
 type Pool struct {
 	groups map[string]*Group
 	mu     sync.RWMutex
+}
+
+// PoolStats captures the current upstream pool state for diagnostics.
+type PoolStats struct {
+	GeneratedAt time.Time             `json:"generated_at"`
+	Groups      map[string]GroupStats `json:"groups"`
+}
+
+type GroupStats struct {
+	Name                  string         `json:"name"`
+	CurrentInstance       string         `json:"current_instance"`
+	PoolSize              int            `json:"pool_size"`
+	TargetPoolSize        int            `json:"target_pool_size"`
+	MaxPoolSize           int            `json:"max_pool_size"`
+	ScaleInFlight         int            `json:"scale_in_flight"`
+	ReplenishInFlight     int            `json:"replenish_in_flight"`
+	ReplenishFailures     int            `json:"replenish_failures"`
+	ReplenishNextAttempt  *time.Time     `json:"replenish_next_attempt,omitempty"`
+	PendingAbandonedDials int64          `json:"pending_abandoned_dials"`
+	Counters              GroupCounters  `json:"counters"`
+	Connections           []SSHConnStats `json:"connections"`
+}
+
+type GroupCounters struct {
+	DialAttempts      uint64 `json:"dial_attempts"`
+	DialWaits         uint64 `json:"dial_waits"`
+	DialSuccesses     uint64 `json:"dial_successes"`
+	DialFailures      uint64 `json:"dial_failures"`
+	DialTimeouts      uint64 `json:"dial_timeouts"`
+	DialCancels       uint64 `json:"dial_cancels"`
+	LateDialSuccesses uint64 `json:"late_dial_successes"`
+	LateDialFailures  uint64 `json:"late_dial_failures"`
+	ForcedReconnects  uint64 `json:"forced_reconnects"`
+	ScaleStarts       uint64 `json:"scale_starts"`
+	ReplenishSuccess  uint64 `json:"replenish_success"`
+	ReplenishFailure  uint64 `json:"replenish_failure"`
+}
+
+type SSHConnStats struct {
+	ID                  uint64     `json:"id"`
+	ActiveChannels      int64      `json:"active_channels"`
+	InflightDials       int64      `json:"inflight_dials"`
+	Draining            bool       `json:"draining"`
+	DialTimeoutCount    int64      `json:"dial_timeout_count"`
+	LastDialTimeoutTime *time.Time `json:"last_dial_timeout_time,omitempty"`
 }
 
 // sshConn represents a single SSH connection through SSM.
@@ -188,6 +237,20 @@ type Group struct {
 	// Per-round instance rotation control: ensures we only rotate once per replenish round
 	// even when multiple concurrent attempts fail.
 	replenishRoundAdvanced int32 // atomic: 1 if already rotated this round, 0 otherwise
+
+	dialAttemptsTotal      uint64
+	dialWaitsTotal         uint64
+	dialSuccessesTotal     uint64
+	dialFailuresTotal      uint64
+	dialTimeoutsTotal      uint64
+	dialCancelsTotal       uint64
+	lateDialSuccessesTotal uint64
+	lateDialFailuresTotal  uint64
+	forcedReconnectsTotal  uint64
+	scaleStartsTotal       uint64
+	replenishSuccessTotal  uint64
+	replenishFailureTotal  uint64
+	pendingAbandonedDials  int64
 }
 
 // NewPool creates a new upstream pool from configuration.
@@ -216,6 +279,88 @@ func NewPool(cfg *config.Config) *Pool {
 	}
 
 	return p
+}
+
+func (p *Pool) Stats() PoolStats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	stats := PoolStats{
+		GeneratedAt: time.Now(),
+		Groups:      make(map[string]GroupStats, len(p.groups)),
+	}
+
+	for name, g := range p.groups {
+		stats.Groups[name] = g.stats()
+	}
+
+	return stats
+}
+
+func (g *Group) stats() GroupStats {
+	g.scaleMu.Lock()
+	scaleInFlight := g.scaleInFlight
+	g.scaleMu.Unlock()
+
+	g.replenishMu.Lock()
+	replenishInFlight := g.replenishInFlight
+	replenishFailures := g.replenishFailures
+	replenishNextAttempt := g.replenishNextAttempt
+	g.replenishMu.Unlock()
+
+	g.connsMu.RLock()
+	connections := make([]SSHConnStats, 0, len(g.conns))
+	for _, sc := range g.conns {
+		var lastDialTimeoutTime *time.Time
+		if last := atomic.LoadInt64(&sc.lastDialTimeoutUnixNano); last > 0 {
+			tm := time.Unix(0, last)
+			lastDialTimeoutTime = &tm
+		}
+		connections = append(connections, SSHConnStats{
+			ID:                  sc.id,
+			ActiveChannels:      atomic.LoadInt64(&sc.activeChannels),
+			InflightDials:       atomic.LoadInt64(&sc.inflightDials),
+			Draining:            sc.isDraining(),
+			DialTimeoutCount:    atomic.LoadInt64(&sc.dialTimeoutCount),
+			LastDialTimeoutTime: lastDialTimeoutTime,
+		})
+	}
+	poolSize := len(g.conns)
+	g.connsMu.RUnlock()
+
+	var nextAttempt *time.Time
+	if !replenishNextAttempt.IsZero() {
+		next := replenishNextAttempt
+		nextAttempt = &next
+	}
+
+	return GroupStats{
+		Name:                  g.name,
+		CurrentInstance:       g.currentInstance(),
+		PoolSize:              poolSize,
+		TargetPoolSize:        defaultPoolSize,
+		MaxPoolSize:           maxPoolSize,
+		ScaleInFlight:         scaleInFlight,
+		ReplenishInFlight:     replenishInFlight,
+		ReplenishFailures:     replenishFailures,
+		ReplenishNextAttempt:  nextAttempt,
+		PendingAbandonedDials: atomic.LoadInt64(&g.pendingAbandonedDials),
+		Counters: GroupCounters{
+			DialAttempts:      atomic.LoadUint64(&g.dialAttemptsTotal),
+			DialWaits:         atomic.LoadUint64(&g.dialWaitsTotal),
+			DialSuccesses:     atomic.LoadUint64(&g.dialSuccessesTotal),
+			DialFailures:      atomic.LoadUint64(&g.dialFailuresTotal),
+			DialTimeouts:      atomic.LoadUint64(&g.dialTimeoutsTotal),
+			DialCancels:       atomic.LoadUint64(&g.dialCancelsTotal),
+			LateDialSuccesses: atomic.LoadUint64(&g.lateDialSuccessesTotal),
+			LateDialFailures:  atomic.LoadUint64(&g.lateDialFailuresTotal),
+			ForcedReconnects:  atomic.LoadUint64(&g.forcedReconnectsTotal),
+			ScaleStarts:       atomic.LoadUint64(&g.scaleStartsTotal),
+			ReplenishSuccess:  atomic.LoadUint64(&g.replenishSuccessTotal),
+			ReplenishFailure:  atomic.LoadUint64(&g.replenishFailureTotal),
+		},
+		Connections: connections,
+	}
 }
 
 func (g *Group) waitChannel() <-chan struct{} {
@@ -513,6 +658,7 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 	}
 
 	g.scaleInFlight += add
+	atomic.AddUint64(&g.scaleStartsTotal, uint64(add))
 	instance := g.currentInstance()
 
 	debugLog("upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
@@ -554,7 +700,9 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 }
 
 // dial attempts to connect through one of the group's SSH connections.
-// Uses goroutine + select to respect context timeout since SSH Dial doesn't accept context.
+// SSH channel opens are not cancelable, so we keep the reserved inflight slot
+// until the underlying Dial returns. This preserves capacity accounting even
+// when the caller's context times out first.
 func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	connID, _ := trace.ConnIDFromContext(ctx)
 	start := time.Now()
@@ -584,6 +732,7 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 
 		if !waitLogged {
 			waitLogged = true
+			atomic.AddUint64(&g.dialWaitsTotal, 1)
 			debugLog("upstream %s: dial waiting for capacity conn=%d addr=%s (pool=%d maxPool=%d)",
 				g.name, connID, addr, poolSize, maxPoolSize)
 		}
@@ -607,9 +756,10 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		case <-waitCh:
 		}
 	}
-	defer g.releaseInflight(sc)
+	atomic.AddUint64(&g.dialAttemptsTotal, 1)
 
 	if sc == nil || sc.sshClient == nil {
+		g.releaseInflight(sc)
 		return nil, fmt.Errorf("upstream %s: not connected", g.name)
 	}
 
@@ -624,46 +774,85 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		conn net.Conn
 		err  error
 	}
-	// Unbuffered channel so we can safely close results when ctx is already done.
+	// Unbuffered channel so the goroutine can tell whether the caller is still waiting.
 	resultCh := make(chan dialResult)
+	var (
+		stateMu     sync.Mutex
+		abandoned   bool
+		cleanupDone bool
+	)
 
 	go func() {
-		conn, err := sc.sshClient.Dial(network, addr)
-		if err != nil {
-			select {
-			case resultCh <- dialResult{conn: nil, err: err}:
-			case <-ctx.Done():
+		conn, err := sshConnDialHook(sc, network, addr)
+
+		stateMu.Lock()
+		timedOut := abandoned
+		stateMu.Unlock()
+		if timedOut {
+			if conn != nil {
+				_ = conn.Close()
+				atomic.AddUint64(&g.lateDialSuccessesTotal, 1)
+			} else {
+				atomic.AddUint64(&g.lateDialFailuresTotal, 1)
 			}
+			atomic.AddInt64(&g.pendingAbandonedDials, -1)
+			g.releaseInflight(sc)
 			return
 		}
 
-		// If the caller is no longer waiting (ctx done), close to avoid leaking an SSH channel.
 		select {
-		case resultCh <- dialResult{conn: conn, err: nil}:
+		case resultCh <- dialResult{conn: conn, err: err}:
 			return
 		case <-ctx.Done():
-			_ = conn.Close()
+			stateMu.Lock()
+			cleanupDone = true
+			timedOut = abandoned
+			stateMu.Unlock()
+
+			if conn != nil {
+				_ = conn.Close()
+				atomic.AddUint64(&g.lateDialSuccessesTotal, 1)
+			} else {
+				atomic.AddUint64(&g.lateDialFailuresTotal, 1)
+			}
+			if timedOut {
+				atomic.AddInt64(&g.pendingAbandonedDials, -1)
+			}
+			g.releaseInflight(sc)
 			return
 		}
 	}()
 
 	select {
 	case <-ctx.Done():
+		stateMu.Lock()
+		if !cleanupDone {
+			abandoned = true
+			atomic.AddInt64(&g.pendingAbandonedDials, 1)
+		}
+		stateMu.Unlock()
+
 		debugLog("upstream %s: dial timeout conn=%d sshConn=%d addr=%s dur=%s err=%v",
 			g.name, connID, sc.id, addr, time.Since(start), ctx.Err())
 
 		// Track repeated timeouts and evict only the problematic sshConn (instead of
 		// reconnecting the whole pool) to reduce blast radius on long-lived transfers.
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			atomic.AddUint64(&g.dialTimeoutsTotal, 1)
 			count := g.recordDialTimeout(sc)
 			if count >= dialTimeoutsBeforeReconnect {
 				g.maybeForceReconnect(sc, fmt.Sprintf("%d dial timeouts within %s (last target=%s)", count, dialTimeoutWindow, addr))
 			}
+			return nil, fmt.Errorf("upstream %s: dial timeout: %w", g.name, ctx.Err())
+		} else {
+			atomic.AddUint64(&g.dialCancelsTotal, 1)
+			return nil, fmt.Errorf("upstream %s: dial canceled: %w", g.name, ctx.Err())
 		}
-		return nil, fmt.Errorf("upstream %s: dial timeout: %w", g.name, ctx.Err())
 
 	case result := <-resultCh:
+		g.releaseInflight(sc)
 		if result.err != nil {
+			atomic.AddUint64(&g.dialFailuresTotal, 1)
 			debugLog("upstream %s: dial failed conn=%d sshConn=%d addr=%s dur=%s err=%v",
 				g.name, connID, sc.id, addr, time.Since(start), result.err)
 			if isTransportError(result.err) {
@@ -678,6 +867,7 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		}
 
 		atomic.AddInt64(&sc.activeChannels, 1)
+		atomic.AddUint64(&g.dialSuccessesTotal, 1)
 		debugLog("upstream %s: dial ok conn=%d sshConn=%d addr=%s dur=%s active=%d",
 			g.name, connID, sc.id, addr, time.Since(start), atomic.LoadInt64(&sc.activeChannels))
 
@@ -757,6 +947,7 @@ func (g *Group) maybeForceReconnect(sc *sshConn, reason string) {
 	}
 
 	atomic.StoreInt64(&g.lastForcedReconnectUnixNano, now)
+	atomic.AddUint64(&g.forcedReconnectsTotal, 1)
 
 	if sc == nil {
 		log.Printf("[WARN] upstream %s: requested reconnect but no connection was selected (%s)", g.name, reason)
@@ -938,6 +1129,7 @@ func (g *Group) recordReplenishSuccess() {
 	g.replenishFailures = 0
 	g.replenishNextAttempt = time.Time{}
 	g.replenishMu.Unlock()
+	atomic.AddUint64(&g.replenishSuccessTotal, 1)
 }
 
 func (g *Group) recordReplenishFailure() (time.Duration, int) {
@@ -950,6 +1142,7 @@ func (g *Group) recordReplenishFailure() (time.Duration, int) {
 	}
 
 	g.replenishFailures++
+	atomic.AddUint64(&g.replenishFailureTotal, 1)
 	delay := g.replenishRetryer.NextDelay(g.replenishFailures)
 	g.replenishNextAttempt = time.Now().Add(delay)
 	return delay, g.replenishFailures

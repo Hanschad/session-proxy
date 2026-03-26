@@ -230,6 +230,72 @@ func TestMaintainStartsReplenishImmediately(t *testing.T) {
 	}
 }
 
+func TestDialTimeoutKeepsInflightReservedUntilDialReturns(t *testing.T) {
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+	}
+
+	sc := &sshConn{
+		id:        1,
+		group:     g,
+		sshClient: &gossh.Client{},
+	}
+
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	origDialHook := sshConnDialHook
+	blockDial := make(chan struct{})
+	sshConnDialHook = func(sc *sshConn, network, addr string) (net.Conn, error) {
+		<-blockDial
+		return nil, errors.New("late dial failure")
+	}
+	defer func() {
+		sshConnDialHook = origDialHook
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_, err := g.dial(ctx, "tcp", "10.0.0.1:80")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline exceeded, got %v", err)
+	}
+
+	if got := atomic.LoadInt64(&sc.inflightDials); got != 1 {
+		t.Fatalf("expected inflight dial to remain reserved after timeout, got %d", got)
+	}
+
+	stats := g.stats()
+	if stats.PendingAbandonedDials != 1 {
+		t.Fatalf("expected 1 pending abandoned dial, got %d", stats.PendingAbandonedDials)
+	}
+
+	close(blockDial)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&sc.inflightDials) == 0 && atomic.LoadInt64(&g.pendingAbandonedDials) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt64(&sc.inflightDials); got != 0 {
+		t.Fatalf("expected inflight dial to be released after dial goroutine exits, got %d", got)
+	}
+	if got := atomic.LoadInt64(&g.pendingAbandonedDials); got != 0 {
+		t.Fatalf("expected pending abandoned dials to drain, got %d", got)
+	}
+
+	finalStats := g.stats()
+	if finalStats.Counters.LateDialFailures != 1 {
+		t.Fatalf("expected 1 late dial failure, got %d", finalStats.Counters.LateDialFailures)
+	}
+}
+
 // mockAdapter simulates protocol.Adapter for testing
 type mockAdapter struct {
 	done      chan struct{}

@@ -468,3 +468,39 @@ func TestRelayHalfClose_NonTCP(t *testing.T) {
 		t.Error("CloseWrite was not called on non-TCP connection implementing the interface")
 	}
 }
+
+func TestHandleConnectCancelsDialOnClientClose(t *testing.T) {
+	srv := New(&Config{
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	client, server := net.Pipe()
+	req := &Request{
+		Cmd: CmdConnect,
+		Addr: &Addr{
+			Type:   AtypDomain,
+			Domain: "example.com",
+			Port:   443,
+		},
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.handleConnect(context.Background(), newBufferedConn(server), req, 1, "pipe")
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := client.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleConnect did not return after client close")
+	}
+}

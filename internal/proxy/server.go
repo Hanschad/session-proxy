@@ -5,76 +5,13 @@ import (
 	"fmt"
 	"log"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/hanschad/session-proxy/internal/config"
 	"github.com/hanschad/session-proxy/internal/router"
 	"github.com/hanschad/session-proxy/internal/socks5"
 	"github.com/hanschad/session-proxy/internal/upstream"
-	sshlib "golang.org/x/crypto/ssh"
 )
-
-// Server is the legacy single-upstream SOCKS5 server.
-type Server struct {
-	port     int
-	socksSrv *socks5.Server
-	listener net.Listener
-
-	sshClient   *sshlib.Client
-	sshClientMu sync.RWMutex
-}
-
-func NewServer(port int, sshClient *sshlib.Client) (*Server, error) {
-	s := &Server{
-		port:      port,
-		sshClient: sshClient,
-	}
-
-	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		client := s.getSSHClient()
-		if client == nil {
-			return nil, fmt.Errorf("SSH client not available")
-		}
-		return client.Dial(network, addr)
-	}
-
-	s.socksSrv = socks5.New(&socks5.Config{
-		Dial: dialer,
-	})
-
-	return s, nil
-}
-
-func (s *Server) UpdateSSHClient(client *sshlib.Client) {
-	s.sshClientMu.Lock()
-	defer s.sshClientMu.Unlock()
-	s.sshClient = client
-	log.Printf("[INFO] SOCKS5 dialer updated with new SSH client")
-}
-
-func (s *Server) getSSHClient() *sshlib.Client {
-	s.sshClientMu.RLock()
-	defer s.sshClientMu.RUnlock()
-	return s.sshClient
-}
-
-func (s *Server) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("127.0.0.1:%d", s.port)
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", addr, err)
-	}
-	s.listener = ln
-
-	go func() {
-		<-ctx.Done()
-		ln.Close()
-	}()
-
-	log.Printf("[INFO] SOCKS5 proxy listening on %s", addr)
-	return s.socksSrv.Serve(ln)
-}
 
 // RoutingServer is a multi-upstream SOCKS5 server with route-based upstream selection.
 type RoutingServer struct {
@@ -135,9 +72,18 @@ func (s *RoutingServer) Start(ctx context.Context) error {
 	go func() {
 		<-ctx.Done()
 		ln.Close()
-		s.pool.Close()
+		if s.pool != nil {
+			s.pool.Close()
+		}
 	}()
 
 	log.Printf("[INFO] SOCKS5 proxy (routing mode) listening on %s", s.listen)
-	return s.socksSrv.Serve(ln)
+	return s.socksSrv.ServeContext(ctx, ln)
+}
+
+func (s *RoutingServer) SOCKSStats() socks5.Stats {
+	if s == nil || s.socksSrv == nil {
+		return socks5.Stats{}
+	}
+	return s.socksSrv.Stats()
 }
