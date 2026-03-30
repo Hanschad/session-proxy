@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 
 	"github.com/hanschad/session-proxy/internal/config"
@@ -36,6 +38,19 @@ func main() {
 	if opt.ShowHelp {
 		opt.PrintUsage()
 		return
+	}
+
+	logFileCloser, err := configureLogging(opt.LogFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: configure logging: %v\n", err)
+		os.Exit(1)
+	}
+	if logFileCloser != nil {
+		defer func() {
+			if closeErr := logFileCloser.Close(); closeErr != nil {
+				log.Printf("[WARN] Failed to close log file: %v", closeErr)
+			}
+		}()
 	}
 
 	if opt.IsDebug() {
@@ -77,6 +92,27 @@ func main() {
 	run(ctx, cfg, opt)
 
 	log.Println("[INFO] Shutdown complete")
+}
+
+func configureLogging(logPath string) (io.Closer, error) {
+	if logPath == "" {
+		return nil, nil
+	}
+
+	dir := filepath.Dir(logPath)
+	if dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("create log directory %q: %w", dir, err)
+		}
+	}
+
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file %q: %w", logPath, err)
+	}
+
+	log.SetOutput(file)
+	return file, nil
 }
 
 func run(ctx context.Context, cfg *config.Config, opt *config.Options) {

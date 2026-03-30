@@ -60,9 +60,18 @@ session-proxy --auth-user admin --auth-pass secret
 # Debug mode
 session-proxy --debug
 
+# Write logs to file (append mode)
+session-proxy --log-file /var/log/session-proxy.log
+
 # Show effective config
 session-proxy --print-config
 ```
+
+### Logging
+
+- Default: logs are written to `stderr` (terminal).
+- File logging: set `--log-file`, `log_file` in config, or `SESSION_PROXY_LOG_FILE`.
+- Log file is opened in append mode and parent directory is created automatically if needed.
 
 ### Using with curl
 

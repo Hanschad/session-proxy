@@ -32,6 +32,7 @@ type Options struct {
 	DiagListen              string        `yaml:"diag_listen" mapstructure:"diag_listen"`
 	Auth                    *AuthConfig   `yaml:"auth" mapstructure:"auth"`
 	Default                 string        `yaml:"default" mapstructure:"default"`
+	LogFile                 string        `yaml:"log_file" mapstructure:"log_file"`
 	SleepDetectionThreshold time.Duration `yaml:"sleep_detection_threshold" mapstructure:"sleep_detection_threshold"`
 
 	// Upstreams and routes are complex, only from file
@@ -64,6 +65,7 @@ func New() *Options {
 	opt.flags.StringVar(&opt.Listen, "listen", "127.0.0.1:28881", "SOCKS5 listen address")
 	opt.flags.StringVar(&opt.DiagListen, "diag-listen", "", "Optional diagnostics listen address (healthz, pprof, state)")
 	opt.flags.StringVar(&opt.Default, "default", "", "Default upstream name")
+	opt.flags.StringVar(&opt.LogFile, "log-file", "", "Path to log file (append mode)")
 
 	// Auth (simplified for CLI)
 	opt.flags.String("auth-user", "", "SOCKS5 auth username")
@@ -262,6 +264,7 @@ func (opt *Options) captureConfigFileUsed() {
 }
 
 var envOnlyKeys = []string{
+	"log_file",
 	"sleep_detection_threshold",
 }
 

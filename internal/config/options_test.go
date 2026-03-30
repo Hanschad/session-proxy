@@ -119,6 +119,66 @@ default: test
 	}
 }
 
+func TestOptionsLogFileFromCLI(t *testing.T) {
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"session-proxy", "--target", "i-legacy-instance", "--log-file", "/tmp/session-proxy.log"}
+	opt := New()
+	if err := opt.Parse(); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if opt.LogFile != "/tmp/session-proxy.log" {
+		t.Fatalf("expected log file /tmp/session-proxy.log, got %q", opt.LogFile)
+	}
+}
+
+func TestOptionsLogFileFromConfigFile(t *testing.T) {
+	content := `
+log_file: "/var/log/session-proxy.log"
+upstreams:
+  test:
+    instances:
+      - i-test-1
+default: test
+`
+	tmpFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(tmpFile, []byte(content), 0644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	os.Args = []string{"session-proxy", "-f", tmpFile}
+	opt := New()
+	if err := opt.Parse(); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if opt.LogFile != "/var/log/session-proxy.log" {
+		t.Fatalf("expected config log file /var/log/session-proxy.log, got %q", opt.LogFile)
+	}
+}
+
+func TestOptionsLogFileFromEnv(t *testing.T) {
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+
+	t.Setenv("SESSION_PROXY_LOG_FILE", "/tmp/from-env.log")
+	os.Args = []string{"session-proxy", "--target", "i-legacy-instance"}
+
+	opt := New()
+	if err := opt.Parse(); err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	if opt.LogFile != "/tmp/from-env.log" {
+		t.Fatalf("expected env log file /tmp/from-env.log, got %q", opt.LogFile)
+	}
+}
+
 func TestOptionsLegacyMode(t *testing.T) {
 	oldArgs := os.Args
 	defer func() { os.Args = oldArgs }()

@@ -7,6 +7,9 @@
 
 listen: "127.0.0.1:28881"
 
+# Optional: write application logs to file (append mode)
+# log_file: /var/log/session-proxy.log
+
 # Optional SOCKS5 authentication (per listen port)
 # auth:
 #   user: admin
