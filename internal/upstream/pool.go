@@ -217,6 +217,10 @@ func (g *Group) startSSHKeepalives(sc *sshConn) {
 			case <-ticker.C:
 			}
 
+			if sc.adapter != nil && sc.adapter.Reconnecting() {
+				continue
+			}
+
 			if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
 				failures := atomic.AddInt64(&sc.keepaliveConsecutiveFailures, 1)
 				if failures >= sshKeepaliveFailureLimit {
@@ -1187,7 +1191,16 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 
 	// Connect via WebSocket
 	stepStart = time.Now()
-	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue)
+	sessionID := session.SessionId
+	adapter, err := protocol.NewAdapter(ctx, session.StreamUrl, session.TokenValue,
+		protocol.WithResume(func(rctx context.Context) (string, string, error) {
+			resumed, resumeErr := ssmClient.ResumeSession(rctx, sessionID)
+			if resumeErr != nil {
+				return "", "", resumeErr
+			}
+			return resumed.StreamUrl, resumed.TokenValue, nil
+		}),
+	)
 	if err != nil {
 		return nil, fmt.Errorf("websocket connect: %w", err)
 	}

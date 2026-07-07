@@ -171,49 +171,42 @@ var handleStreamMessageResendTimeout = func(session *Session, log log.T) {
 }
 ```
 
-## 5. Lessons Learned: ResumeSession vs SSH Tunnels
+## 5. ResumeSession for SSH Tunnels (Corrected)
 
-> [!CAUTION]
-> `ResumeSession` does NOT work for SSH-over-SSM tunnels.
+Earlier experiments concluded that `ResumeSession` does not work for SSH-over-SSM tunnels. That result came from **re-running the SSH handshake** after resume. The agent-side TCP connection to `sshd` still holds the existing SSH session; attempting a fresh SSH handshake on top of a resumed SSM channel will hang.
 
-### The Problem
-When implementing reconnection for `session-proxy`, we initially used `ResumeSession` (as AWS plugin does). However, this failed silently:
+The correct model matches the official session-manager-plugin:
 
-1. `ResumeSession` API succeeded ✅
-2. New WebSocket connected ✅
-3. SSM handshake skipped (expected for resume) ✅
-4. **SSH handshake hung indefinitely** ❌
+| Layer | On WebSocket drop | Action |
+|-------|-------------------|--------|
+| SSM WebSocket | Broken | `ResumeSession` → new token → re-dial WebSocket → `OpenDataChannel` |
+| SSM sequence state | Preserved | Keep `seqNum`, unacked `outgoing`, `expectedSeqNum` |
+| SSH session | Preserved | **Do not** close `sshClient` or re-handshake |
+| User TCP streams | Preserved | Adapter `net.Conn` stays open; unacked frames retransmit |
 
-### Root Cause
-The AWS SSM protocol has **multiple layers**:
+`session-proxy` now implements this transparent WebSocket resume when `WithResume` is wired from the upstream pool.
 
-| Layer | ResumeSession Restores? |
-|-------|------------------------|
-| SSM WebSocket | ✅ Yes |
-| SSM Handshake | ✅ Yes (skipped) |
-| **SSH Session** | ❌ **No** |
+### Environment variables
 
-When the WebSocket closes, the SSH session state (keys, channels) is lost. `ResumeSession` only restores the *transport*, not the *application* running inside it.
+- `SESSION_PROXY_SSM_RESUME=off` — disable resume; transport failures close the adapter (legacy behavior).
+- `SESSION_PROXY_SSM_RESUME_BUDGET` — total time budget for resume attempts (default `90s`).
 
-### The Fix
-For SSH-over-SSM, **always use `StartSession`** on reconnect:
+### Pool replenishment vs resume
 
-```go
-// ResumeSession does NOT work for SSH tunnels because:
-// - It only resumes SSM/WebSocket layer
-// - SSH state is lost when WebSocket closes
-// - SSH requires fresh handshake which resumed session cannot provide
-session, err := m.ssmClient.StartSession(ctx, m.instanceID)
+- **Resume** — same SSM session + same SSH connection; for transient WebSocket loss.
+- **Replenish (`StartSession`)** — new SSM session + new SSH handshake; for dead SSH transport or adapter budget exhaustion.
+
+### Validation experiment
+
+Run against a real environment:
+
+```bash
+go run ./cmd/resume-experiment --config config.yaml --upstream prod
 ```
 
-### When ResumeSession DOES Work
-- Interactive shell sessions (`AWS-StartInteractiveCommand`)
-- Port forwarding where the *application layer* doesn't maintain state
+The tool opens an SSH session that prints `tick-N` every second, force-closes the WebSocket after 10s, and reports `PASS` if ticks continue without a new SSH session.
 
 ## Verdict
 
-The implementation demonstrates extreme resilience. It prioritizes **Session Continuity** over **Connection Stability**. By implementing its own Transport Layer Reliability (Sequence Numbers + ACKs + Buffering) on top of WebSocket, it ensures that even if the physical wire is cut and re-spliced (via `ResumeSession`), the user's terminal experience remains unbroken.
-
-> [!IMPORTANT]
-> For SSH tunnels, use `StartSession` on reconnect. `ResumeSession` is only for stateless session types.
+The implementation prioritizes **Session Continuity** over **Connection Stability**. Transport-layer reliability (sequence numbers, ACKs, buffering, resume) keeps long-lived SSH and database connections alive across transient WebSocket loss, while pool replenishment handles dead transports.
 

@@ -8,8 +8,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"strconv"
 	"sync"
@@ -102,13 +100,54 @@ var (
 	errChannelClosedByRemote        = errors.New("channel closed by remote")
 	errPausePublicationTimedOut     = errors.New("pause_publication exceeded limit")
 	errResendAttemptsExceeded       = errors.New("retransmission attempts exceeded limit")
+	errResumeBudgetExhausted        = errors.New("websocket resume budget exhausted")
+)
+
+// ResumeFunc obtains fresh data-channel credentials (stream URL + token) for an
+// existing SSM session, typically via the ResumeSession API. It is called by the
+// adapter when the underlying WebSocket drops and needs to be re-established.
+type ResumeFunc func(ctx context.Context) (streamUrl, token string, err error)
+
+// AdapterOption customizes adapter construction.
+type AdapterOption func(*Adapter)
+
+// WithResume enables transparent WebSocket reconnection: when the transport
+// drops, the adapter calls fn to get a fresh stream URL/token and swaps in a
+// new WebSocket while keeping all session-layer state (sequence numbers,
+// unacked buffer, SSH stream) intact.
+func WithResume(fn ResumeFunc) AdapterOption {
+	return func(a *Adapter) {
+		a.resumeFunc = fn
+	}
+}
+
+const (
+	// defaultResumeBudget bounds the total time spent trying to resume a dropped
+	// WebSocket before giving up and closing the adapter. Override via
+	// SESSION_PROXY_SSM_RESUME_BUDGET.
+	defaultResumeBudget = 90 * time.Second
 )
 
 // Adapter implements net.Conn over an SSM WebSocket session
 type Adapter struct {
+	// connMu guards conn and connGen. The generation counter lets goroutines
+	// bound to an old WebSocket (readLoop, ping loop) detect that their
+	// connection has been replaced and exit without touching the new one.
+	connMu  sync.RWMutex
 	conn    *websocket.Conn
+	connGen uint64
+
 	writeMu sync.Mutex
 	seqNum  int64
+
+	// WebSocket resume (ResumeSession-based reconnect) state.
+	resumeFunc     ResumeFunc
+	resumeDisabled bool // via SESSION_PROXY_SSM_RESUME=off
+	resumeBudget   time.Duration
+
+	reconnectMu   sync.Mutex
+	reconnecting  bool
+	reconnectGate chan struct{} // non-nil while reconnecting; closed on success
 
 	writeDeadlineMu sync.RWMutex
 	writeDeadline   time.Time
@@ -158,6 +197,8 @@ type Adapter struct {
 	closeOnce     sync.Once
 	closeReasonMu sync.Mutex
 	closeReason   error // first error wins
+
+	clientId string // stable OpenDataChannel client id across resume
 }
 
 // ClientVersion is the SSM protocol version reported to AWS SSM service.
@@ -182,51 +223,17 @@ const (
 	tcpKeepAlive = 30 * time.Second
 )
 
-func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) {
-	netDialer := &net.Dialer{
-		Timeout:   dialTimeout,
-		KeepAlive: tcpKeepAlive,
-	}
-	// Explicit dialer so we can enforce timeouts/keepalive.
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-		NetDialContext:   netDialer.DialContext,
-		Proxy:            http.ProxyFromEnvironment,
-	}
-
-	// Parse the stream URL to safely append the token
-	parsedUrl, err := url.Parse(streamUrl)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse stream url: %w", err)
-	}
-
-	// Don't append token to URL - it's sent in the OpenDataChannel message
-	fullUrl := parsedUrl.String()
-
-	debugLog("Dialing WebSocket: %s", fullUrl)
-	wsConn, _, err := dialer.DialContext(ctx, fullUrl, nil)
+func NewAdapter(ctx context.Context, streamUrl, token string, opts ...AdapterOption) (*Adapter, error) {
+	debugLog("Dialing WebSocket: %s", streamUrl)
+	wsConn, err := adapterDialWebSocketHook(ctx, streamUrl)
 	if err != nil {
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
-	}
-
-	// OpenDataChannelInput - matches session-manager-plugin format (section 5.4)
-	initMsg := map[string]string{
-		"MessageSchemaVersion": "1.0",
-		"RequestId":            CleanUUID(uuid.New()),
-		"TokenValue":           token,
-		"ClientId":             CleanUUID(uuid.New()),
-		"ClientVersion":        ClientVersion,
-	}
-	debugLog("Sending OpenDataChannel: %+v", initMsg)
-	_ = wsConn.SetWriteDeadline(time.Now().Add(writeWait))
-	if err := wsConn.WriteJSON(initMsg); err != nil {
-		wsConn.Close()
-		return nil, fmt.Errorf("failed to send OpenDataChannel message: %w", err)
 	}
 
 	readConn, writeConn := net.Pipe()
 	adapter := &Adapter{
 		conn:              wsConn,
+		connGen:           1,
 		streamReader:      readConn,
 		streamWriter:      writeConn,
 		seenMsgIds:        make(map[uuid.UUID]int64),
@@ -235,6 +242,7 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		incomingMsgBuffer: make(map[int64]*AgentMessage),
 		expectedSeqNum:    0,
 		chunkSize:         defaultStreamChunkSize,
+		clientId:          CleanUUID(uuid.New()),
 
 		outgoing:                make(map[int64]*outgoingMessage),
 		outgoingOldestSeq:       -1,
@@ -242,6 +250,7 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		maxOutgoingUnackedBytes: defaultMaxOutgoingUnackedBytes,
 	}
 	adapter.outgoingCond = sync.NewCond(&adapter.outgoingMu)
+	applyAdapterOptions(adapter, opts)
 
 	// Allow overriding stream chunk size via env var for performance tuning.
 	// This impacts client->agent throughput for large uploads.
@@ -271,85 +280,18 @@ func NewAdapter(ctx context.Context, streamUrl, token string) (*Adapter, error) 
 		}
 	}
 
-	// Read deadline + pong handler to detect half-open connections.
-	// Each pong extends the read deadline.
-	_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
-	wsConn.SetPongHandler(func(appData string) error {
-		_ = wsConn.SetReadDeadline(time.Now().Add(pongWait))
-		debugLog("WebSocket Pong received")
-		return nil
-	})
+	if err := adapter.sendOpenDataChannel(wsConn, token); err != nil {
+		wsConn.Close()
+		return nil, fmt.Errorf("failed to send OpenDataChannel message: %w", err)
+	}
 
-	go adapter.readLoop()
-	go adapter.startPings()
+	adapter.installPongHandler(wsConn, adapter.connGen)
+
+	go adapter.readLoopForGen(adapter.connGen)
+	go adapter.pingLoopForGen(adapter.connGen)
 	go adapter.resendLoop()
 
 	return adapter, nil
-}
-
-func (a *Adapter) readLoop() {
-	for {
-		msg, err := a.readMessage()
-		if err != nil {
-			if a.streamWriter != nil {
-				_ = a.streamWriter.Close()
-			}
-			a.closeWithError(err)
-			return
-		}
-		if msg == nil {
-			continue // unmarshal error, already logged
-		}
-		if !a.dispatchMessage(msg) {
-			return // channel closed
-		}
-	}
-}
-
-// readMessage reads and parses a single message from WebSocket
-func (a *Adapter) readMessage() (*AgentMessage, error) {
-	_, msgBytes, err := a.conn.ReadMessage()
-	if err != nil {
-		log.Printf("[WARN] WS Read Error: %v", err)
-		return nil, err
-	}
-
-	agentMsg, err := UnmarshalMessage(msgBytes)
-	if err != nil {
-		debugLog("Unmarshal Error: %v", err)
-		return nil, nil // non-fatal, return nil message
-	}
-
-	// Keep per-frame logging lightweight; full per-frame logs become a bottleneck for large transfers.
-	// Always log control/non-stream frames. For stream frames, sample every N messages.
-	sample := true
-	switch agentMsg.Header.MessageType {
-	case MsgTypeOutputStreamData, MsgTypeInputStreamData:
-		sample = agentMsg.Header.SequenceNumber%rxFrameLogEveryN == 0
-	case MsgTypeAcknowledge:
-		// ACK header SequenceNumber is always 0, so sample based on a local counter.
-		a.rxAckCount++
-		sample = a.rxAckCount%rxFrameLogEveryN == 0
-	}
-	if sample {
-		debugLog("RX Frame: Type=%s Seq=%d Len=%d Flags=%d PayloadType=%d HL=%d MsgId=%s",
-			agentMsg.Header.MessageType,
-			agentMsg.Header.SequenceNumber,
-			len(agentMsg.Payload),
-			agentMsg.Header.Flags,
-			agentMsg.Header.PayloadType,
-			agentMsg.Header.HeaderLength,
-			agentMsg.Header.MessageId.String())
-	}
-
-	// Avoid dumping binary payloads (e.g. TLS) into logs. Keep small readable payloads.
-	if agentMsg.Header.MessageType == MsgTypeOutputStreamData {
-		if len(agentMsg.Payload) <= maxTextPayloadLogBytes && looksMostlyText(agentMsg.Payload) {
-			debugLog("Output Payload (text): %q", string(agentMsg.Payload))
-		}
-	}
-
-	return agentMsg, nil
 }
 
 // dispatchMessage routes message to appropriate handler. Returns false if channel closed.
@@ -574,6 +516,10 @@ func (a *Adapter) resendLoop() {
 		case <-ticker.C:
 		}
 
+		if a.Reconnecting() {
+			continue
+		}
+
 		// Check pause timeout independently of resend logic.
 		a.pauseMu.Lock()
 		paused := a.paused
@@ -644,7 +590,9 @@ func (a *Adapter) resendLoop() {
 
 		if err := a.writeRaw(data, MsgTypeInputStreamData, PayloadTypeOutput); err != nil {
 			debugLog("Resend failed: seq=%d err=%v", seq, err)
-			a.closeWithError(fmt.Errorf("resend write failed: %w", err))
+			if a.handleTransportFailure(fmt.Errorf("resend write failed: %w", err)) {
+				return
+			}
 			return
 		}
 	}
@@ -827,18 +775,26 @@ func (a *Adapter) writeMessage(msg *AgentMessage) error {
 }
 
 func (a *Adapter) writeRaw(data []byte, msgType string, payloadType uint32) error {
+	if err := a.waitUntilConnected(); err != nil {
+		return err
+	}
+
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
 
-	if a.conn == nil {
+	conn, gen := a.getConn()
+	if conn == nil {
 		return io.ErrClosedPipe
 	}
 
 	// SSM uses BinaryMessage for frames
-	_ = a.conn.SetWriteDeadline(a.effectiveWriteDeadline())
-	err := a.conn.WriteMessage(websocket.BinaryMessage, data)
+	_ = conn.SetWriteDeadline(a.effectiveWriteDeadline())
+	err := conn.WriteMessage(websocket.BinaryMessage, data)
 	if err != nil {
-		debugLog("WebSocket WriteMessage FAILED: %v", err)
+		debugLog("WebSocket WriteMessage FAILED: gen=%d err=%v", gen, err)
+		if a.handleTransportFailure(err) {
+			return err
+		}
 		return err
 	}
 
@@ -1066,52 +1022,20 @@ func (a *Adapter) Close() error {
 			_ = a.streamWriter.Close()
 		}
 		if a.conn != nil {
-			_ = a.conn.Close()
+			a.connMu.Lock()
+			if a.conn != nil {
+				_ = a.conn.Close()
+				a.conn = nil
+			}
+			a.connMu.Unlock()
 		}
 	})
 	return nil
 }
 
-// startPings sends periodic WebSocket ping frames to keep the connection alive.
-// This is required because AWS SSM service will close idle connections.
-// Matches the behavior of AWS session-manager-plugin (websocketchannel.go:85-104).
+// startPings is kept for compatibility; ping loops are generation-scoped.
 func (a *Adapter) startPings() {
-	debugLog("Ping loop started, interval=%v", PingInterval)
-	ticker := time.NewTicker(PingInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.done:
-			debugLog("Stopping ping loop - adapter closed")
-			return
-		case <-ticker.C:
-			sendPing := func() error {
-				deadline := time.Now().Add(writeWait)
-				a.writeMu.Lock()
-				err := a.conn.WriteControl(websocket.PingMessage, []byte("keepalive"), deadline)
-				a.writeMu.Unlock()
-				return err
-			}
-
-			err := sendPing()
-			if err != nil {
-				debugLog("WebSocket Ping failed (first attempt): %v", err)
-				if pingRetryErr := a.sleepWithWriteDeadline(500 * time.Millisecond); pingRetryErr != nil {
-					a.closeWithError(fmt.Errorf("websocket ping failed before retry: %w", err))
-					return
-				}
-
-				err = sendPing()
-				if err != nil {
-					debugLog("WebSocket Ping failed (retry): %v, closing adapter to trigger reconnect", err)
-					a.closeWithError(fmt.Errorf("websocket ping failed after retry: %w", err))
-					return
-				}
-			}
-			debugLog("WebSocket Ping sent")
-		}
-	}
+	go a.pingLoopForGen(a.currentConnGen())
 }
 
 // Done returns a channel that is closed when the adapter is closed.
@@ -1122,12 +1046,20 @@ func (a *Adapter) Done() <-chan struct{} {
 
 // LocalAddr implements net.Conn
 func (a *Adapter) LocalAddr() net.Addr {
-	return a.conn.LocalAddr()
+	conn, _ := a.getConn()
+	if conn == nil {
+		return &net.TCPAddr{}
+	}
+	return conn.LocalAddr()
 }
 
 // RemoteAddr implements net.Conn
 func (a *Adapter) RemoteAddr() net.Addr {
-	return a.conn.RemoteAddr()
+	conn, _ := a.getConn()
+	if conn == nil {
+		return &net.TCPAddr{}
+	}
+	return conn.RemoteAddr()
 }
 
 // SetDeadline implements net.Conn
@@ -1163,7 +1095,11 @@ func (a *Adapter) SetWriteDeadline(t time.Time) error {
 	if a.conn == nil {
 		return nil
 	}
-	return a.conn.SetWriteDeadline(t)
+	conn, _ := a.getConn()
+	if conn == nil {
+		return nil
+	}
+	return conn.SetWriteDeadline(t)
 }
 
 func (a *Adapter) currentWriteDeadline() time.Time {
@@ -1296,7 +1232,9 @@ func (a *Adapter) handleDataMessage(msg *AgentMessage) {
 	// Always send ACK (even for out-of-order or duplicate messages)
 	if err := a.sendAck(msg); err != nil {
 		debugLog("Ack Send Error: %v", err)
-		a.closeWithError(fmt.Errorf("send data ack: %w", err))
+		if a.handleTransportFailure(fmt.Errorf("send data ack: %w", err)) {
+			return
+		}
 		return
 	}
 
