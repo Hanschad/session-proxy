@@ -230,6 +230,201 @@ func TestMaintainStartsReplenishImmediately(t *testing.T) {
 	}
 }
 
+func TestKeepaliveFailuresCloseAndRemoveConn(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+
+	sc := &sshConn{id: 42, group: g}
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	origProbe := sshConnKeepaliveProbeHook
+	origDone := sshConnDoneHook
+	origClose := sshConnCloseHook
+	origInterval := sshKeepaliveIntervalHook
+	defer func() {
+		sshConnKeepaliveProbeHook = origProbe
+		sshConnDoneHook = origDone
+		sshConnCloseHook = origClose
+		sshKeepaliveIntervalHook = origInterval
+	}()
+	sshKeepaliveIntervalHook = func() time.Duration { return 20 * time.Millisecond }
+
+	adapterDone := make(chan struct{})
+	sshConnDoneHook = func(target *sshConn) <-chan struct{} {
+		if target == sc {
+			return adapterDone
+		}
+		return nil
+	}
+
+	var probeCalls int64
+	sshConnKeepaliveProbeHook = func(target *sshConn, timeout time.Duration) error {
+		if target != sc {
+			return nil
+		}
+		atomic.AddInt64(&probeCalls, 1)
+		return errors.New("keepalive failed")
+	}
+
+	var closeCalls int64
+	sshConnCloseHook = func(target *sshConn) {
+		if target == sc {
+			atomic.AddInt64(&closeCalls, 1)
+			select {
+			case <-adapterDone:
+			default:
+				close(adapterDone)
+			}
+		}
+	}
+
+	g.startSSHKeepalives(sc)
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&probeCalls) >= sshKeepaliveFailureLimit && atomic.LoadInt64(&closeCalls) >= 1 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt64(&probeCalls); got < sshKeepaliveFailureLimit {
+		t.Fatalf("expected at least %d keepalive probes, got %d", sshKeepaliveFailureLimit, got)
+	}
+	if got := atomic.LoadInt64(&closeCalls); got != 1 {
+		t.Fatalf("expected connection to be closed once, got %d", got)
+	}
+
+	g.maintainOnce(time.Now())
+	g.connsMu.RLock()
+	defer g.connsMu.RUnlock()
+	if len(g.conns) != 0 {
+		t.Fatalf("expected closed connection to be removed from pool, still have %d", len(g.conns))
+	}
+}
+
+func TestDialTimeoutReconnectProbeSuccessRestoresConn(t *testing.T) {
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+	}
+
+	sc := &sshConn{id: 7, group: g}
+	atomic.StoreInt64(&sc.dialTimeoutCount, 3)
+	atomic.StoreInt64(&sc.lastDialTimeoutUnixNano, time.Now().UnixNano())
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	origProbe := sshConnKeepaliveProbeHook
+	defer func() { sshConnKeepaliveProbeHook = origProbe }()
+
+	probeCalled := make(chan struct{}, 1)
+	sshConnKeepaliveProbeHook = func(target *sshConn, timeout time.Duration) error {
+		if target == sc {
+			select {
+			case probeCalled <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+
+	g.maybeForceReconnect(sc, "test timeouts")
+
+	select {
+	case <-probeCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected reconnect path to probe connection")
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&g.forcedReconnectInProgress) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if atomic.LoadInt32(&g.forcedReconnectInProgress) != 0 {
+		t.Fatal("forced reconnect worker did not finish")
+	}
+
+	if sc.isDraining() {
+		t.Fatal("expected connection to be un-drained after successful probe")
+	}
+	if got := atomic.LoadInt64(&sc.dialTimeoutCount); got != 0 {
+		t.Fatalf("expected dial timeout counter reset, got %d", got)
+	}
+	if got := atomic.LoadInt64(&sc.lastDialTimeoutUnixNano); got != 0 {
+		t.Fatalf("expected last dial timeout timestamp reset, got %d", got)
+	}
+	g.connsMu.RLock()
+	if len(g.conns) != 1 || g.conns[0] != sc {
+		g.connsMu.RUnlock()
+		t.Fatal("expected connection to remain in pool after healthy probe")
+	}
+	g.connsMu.RUnlock()
+}
+
+func TestMaintainWakeProbeKeepsHealthyConnections(t *testing.T) {
+	g := &Group{
+		name:                    "test",
+		instances:               []string{"i-test-1"},
+		sleepDetectionThreshold: time.Minute,
+		lastMaintainTime:        time.Now().Add(-2 * time.Minute),
+	}
+
+	healthy := &sshConn{id: 1, group: g}
+	unhealthy := &sshConn{id: 2, group: g}
+	g.connsMu.Lock()
+	g.conns = []*sshConn{healthy, unhealthy}
+	g.connsMu.Unlock()
+
+	origProbe := sshConnKeepaliveProbeHook
+	origClose := sshConnCloseHook
+	defer func() {
+		sshConnKeepaliveProbeHook = origProbe
+		sshConnCloseHook = origClose
+	}()
+
+	var closedUnhealthy int64
+	sshConnCloseHook = func(target *sshConn) {
+		if target == unhealthy {
+			atomic.AddInt64(&closedUnhealthy, 1)
+		}
+	}
+
+	sshConnKeepaliveProbeHook = func(target *sshConn, timeout time.Duration) error {
+		if target == unhealthy {
+			return errors.New("probe failed")
+		}
+		return nil
+	}
+
+	g.maintainOnce(time.Now())
+
+	g.connsMu.RLock()
+	defer g.connsMu.RUnlock()
+	if len(g.conns) != 1 {
+		t.Fatalf("expected one healthy connection left, got %d", len(g.conns))
+	}
+	if g.conns[0] != healthy {
+		t.Fatal("expected healthy connection to remain after wake probe")
+	}
+	if got := atomic.LoadInt64(&closedUnhealthy); got != 1 {
+		t.Fatalf("expected unhealthy connection to be closed once, got %d", got)
+	}
+}
+
 func TestDialTimeoutKeepsInflightReservedUntilDialReturns(t *testing.T) {
 	g := &Group{
 		name:      "test",

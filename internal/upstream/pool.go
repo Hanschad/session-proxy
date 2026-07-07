@@ -44,6 +44,27 @@ var sshConnDialHook = func(sc *sshConn, network, addr string) (net.Conn, error) 
 	return sc.sshClient.Dial(network, addr)
 }
 
+var sshConnKeepaliveProbeHook = func(sc *sshConn, timeout time.Duration) error {
+	return sc.probeKeepalive(timeout)
+}
+
+var sshConnDoneHook = func(sc *sshConn) <-chan struct{} {
+	if sc == nil || sc.adapter == nil {
+		return nil
+	}
+	return sc.adapter.Done()
+}
+
+var sshConnCloseHook = func(sc *sshConn) {
+	if sc != nil {
+		sc.close()
+	}
+}
+
+var sshKeepaliveIntervalHook = func() time.Duration {
+	return sshKeepaliveInterval
+}
+
 // Pool manages multiple upstream connections.
 type Pool struct {
 	groups map[string]*Group
@@ -87,12 +108,13 @@ type GroupCounters struct {
 }
 
 type SSHConnStats struct {
-	ID                  uint64     `json:"id"`
-	ActiveChannels      int64      `json:"active_channels"`
-	InflightDials       int64      `json:"inflight_dials"`
-	Draining            bool       `json:"draining"`
-	DialTimeoutCount    int64      `json:"dial_timeout_count"`
-	LastDialTimeoutTime *time.Time `json:"last_dial_timeout_time,omitempty"`
+	ID                           uint64     `json:"id"`
+	ActiveChannels               int64      `json:"active_channels"`
+	InflightDials                int64      `json:"inflight_dials"`
+	Draining                     bool       `json:"draining"`
+	DialTimeoutCount             int64      `json:"dial_timeout_count"`
+	KeepaliveConsecutiveFailures int64      `json:"keepalive_consecutive_failures"`
+	LastDialTimeoutTime          *time.Time `json:"last_dial_timeout_time,omitempty"`
 }
 
 // sshConn represents a single SSH connection through SSM.
@@ -111,10 +133,16 @@ type sshConn struct {
 	lastDialTimeoutUnixNano int64
 
 	draining int32 // atomic: 1 = draining (no new channels), 0 = normal
+
+	keepaliveConsecutiveFailures int64
 }
 
 func (sc *sshConn) markDraining() {
 	atomic.StoreInt32(&sc.draining, 1)
+}
+
+func (sc *sshConn) unmarkDraining() {
+	atomic.StoreInt32(&sc.draining, 0)
 }
 
 func (sc *sshConn) isDraining() bool {
@@ -134,19 +162,110 @@ func (sc *sshConn) close() {
 	}
 }
 
+func (sc *sshConn) probeKeepalive(timeout time.Duration) error {
+	if sc == nil || sc.sshClient == nil {
+		return errors.New("ssh client unavailable")
+	}
+
+	resultCh := make(chan error, 1)
+	go func() {
+		_, _, err := sc.sshClient.SendRequest("keepalive@openssh.com", true, nil)
+		resultCh <- err
+	}()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-resultCh:
+		if err != nil {
+			return fmt.Errorf("ssh keepalive failed: %w", err)
+		}
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("ssh keepalive timed out after %s", timeout)
+	}
+}
+
+const (
+	sshKeepaliveInterval      = 15 * time.Second
+	sshKeepaliveProbeTimeout  = 10 * time.Second
+	sshKeepaliveFailureLimit  = 2
+	drainingConnHardCloseWait = 10 * time.Minute
+)
+
+func (g *Group) startSSHKeepalives(sc *sshConn) {
+	if sc == nil {
+		return
+	}
+
+	go func() {
+		ticker := time.NewTicker(sshKeepaliveIntervalHook())
+		defer ticker.Stop()
+
+		var groupDone <-chan struct{}
+		if g != nil && g.ctx != nil {
+			groupDone = g.ctx.Done()
+		}
+		adapterDone := sshConnDoneHook(sc)
+		for {
+			select {
+			case <-groupDone:
+				return
+			case <-adapterDone:
+				return
+			case <-ticker.C:
+			}
+
+			if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+				failures := atomic.AddInt64(&sc.keepaliveConsecutiveFailures, 1)
+				if failures >= sshKeepaliveFailureLimit {
+					log.Printf("[WARN] upstream %s: ssh keepalive failed for connection (sshConn=%d failures=%d), closing connection: %v",
+						g.name, sc.id, failures, err)
+					sshConnCloseHook(sc)
+					return
+				}
+				debugLog("upstream %s: ssh keepalive transient failure (sshConn=%d failures=%d): %v",
+					g.name, sc.id, failures, err)
+				continue
+			}
+
+			atomic.StoreInt64(&sc.keepaliveConsecutiveFailures, 0)
+		}
+	}()
+}
+
 // closeDrainingConns waits for each connection to become idle (or timeout) and closes it.
 func (g *Group) closeDrainingConns(conns []*sshConn, timeout time.Duration) {
-	deadline := time.Now().Add(timeout)
 	for _, sc := range conns {
-		for time.Now().Before(deadline) {
+		softDeadline := time.Now().Add(timeout)
+		hardDeadline := time.Now().Add(drainingConnHardCloseWait)
+		for {
 			if sc.isIdle() {
+				log.Printf("[INFO] upstream %s: closing draining connection (sshConn=%d, reason=idle)", g.name, sc.id)
+				sshConnCloseHook(sc)
 				break
 			}
+
+			now := time.Now()
+			if now.After(hardDeadline) {
+				log.Printf("[WARN] upstream %s: force-closing draining connection at hard deadline (sshConn=%d)", g.name, sc.id)
+				sshConnCloseHook(sc)
+				break
+			}
+
+			if now.After(softDeadline) {
+				if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+					log.Printf("[WARN] upstream %s: force-closing unhealthy draining connection (sshConn=%d): %v", g.name, sc.id, err)
+					sshConnCloseHook(sc)
+					break
+				}
+				log.Printf("[INFO] upstream %s: leaving draining connection open while still active (sshConn=%d)", g.name, sc.id)
+				softDeadline = time.Now().Add(timeout)
+			}
+
 			time.Sleep(1 * time.Second)
 		}
-		log.Printf("[INFO] upstream %s: closing draining connection (sshConn=%d, idle=%v)",
-			g.name, sc.id, sc.isIdle())
-		sc.close()
 	}
 }
 
@@ -317,12 +436,13 @@ func (g *Group) stats() GroupStats {
 			lastDialTimeoutTime = &tm
 		}
 		connections = append(connections, SSHConnStats{
-			ID:                  sc.id,
-			ActiveChannels:      atomic.LoadInt64(&sc.activeChannels),
-			InflightDials:       atomic.LoadInt64(&sc.inflightDials),
-			Draining:            sc.isDraining(),
-			DialTimeoutCount:    atomic.LoadInt64(&sc.dialTimeoutCount),
-			LastDialTimeoutTime: lastDialTimeoutTime,
+			ID:                           sc.id,
+			ActiveChannels:               atomic.LoadInt64(&sc.activeChannels),
+			InflightDials:                atomic.LoadInt64(&sc.inflightDials),
+			Draining:                     sc.isDraining(),
+			DialTimeoutCount:             atomic.LoadInt64(&sc.dialTimeoutCount),
+			KeepaliveConsecutiveFailures: atomic.LoadInt64(&sc.keepaliveConsecutiveFailures),
+			LastDialTimeoutTime:          lastDialTimeoutTime,
 		})
 	}
 	poolSize := len(g.conns)
@@ -955,13 +1075,27 @@ func (g *Group) maybeForceReconnect(sc *sshConn, reason string) {
 		return
 	}
 
-	log.Printf("[WARN] upstream %s: evicting pool connection (sshConn=%d) (%s)", g.name, sc.id, reason)
+	log.Printf("[WARN] upstream %s: marking connection draining for health verification (sshConn=%d) (%s)", g.name, sc.id, reason)
+	sc.markDraining()
+	g.signalCapacityChange()
 
 	go func() {
 		defer atomic.StoreInt32(&g.forcedReconnectInProgress, 0)
-		g.connsMu.Lock()
-		g.removeConn(sc)
-		g.connsMu.Unlock()
+
+		if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+			log.Printf("[WARN] upstream %s: draining connection failed keepalive probe, evicting (sshConn=%d): %v", g.name, sc.id, err)
+			g.connsMu.Lock()
+			g.removeConn(sc)
+			g.connsMu.Unlock()
+			return
+		}
+
+		sc.unmarkDraining()
+		atomic.StoreInt64(&sc.dialTimeoutCount, 0)
+		atomic.StoreInt64(&sc.lastDialTimeoutUnixNano, 0)
+		atomic.StoreInt64(&sc.keepaliveConsecutiveFailures, 0)
+		g.signalCapacityChange()
+		log.Printf("[INFO] upstream %s: keepalive probe succeeded, restoring connection (sshConn=%d)", g.name, sc.id)
 	}()
 }
 
@@ -1076,12 +1210,14 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 	}
 	debugLog("upstream %s: connectSingle step=ssh_connect ok dur=%s", g.name, time.Since(stepStart))
 
-	return &sshConn{
+	sc := &sshConn{
 		id:        atomic.AddUint64(&nextSSHConnID, 1),
 		group:     g,
 		adapter:   adapter,
 		sshClient: sshClient,
-	}, nil
+	}
+	g.startSSHKeepalives(sc)
+	return sc, nil
 }
 
 func (g *Group) reserveReplenish(currentCount int) (int, time.Duration) {
@@ -1226,23 +1362,61 @@ func (g *Group) maintainOnce(now time.Time) {
 	if !g.lastMaintainTime.IsZero() && g.sleepDetectionThreshold > 0 {
 		elapsed := now.Sub(g.lastMaintainTime)
 		if elapsed > g.sleepDetectionThreshold {
-			log.Printf("[INFO] upstream %s: detected system wake after %s, resetting backoff and clearing stale connections",
+			log.Printf("[INFO] upstream %s: detected system wake after %s, probing pooled connections",
 				g.name, elapsed)
 			g.resetReplenishBackoff()
-			// Mark all connections as draining and move them out of the pool.
-			// They will be closed gracefully once idle.
-			g.connsMu.Lock()
-			oldConns := g.conns
-			for _, sc := range oldConns {
-				sc.markDraining()
-			}
-			g.conns = nil // Trigger replenish with fresh connections
-			g.connsMu.Unlock()
-			g.signalCapacityChange()
-			g.notifyMaintain()
 
-			// Gracefully close old connections in background once they become idle.
-			go g.closeDrainingConns(oldConns, 30*time.Second)
+			g.connsMu.RLock()
+			candidates := append([]*sshConn(nil), g.conns...)
+			g.connsMu.RUnlock()
+
+			if len(candidates) > 0 {
+				type probeResult struct {
+					sc  *sshConn
+					err error
+				}
+				results := make(chan probeResult, len(candidates))
+				var wg sync.WaitGroup
+				for _, sc := range candidates {
+					wg.Add(1)
+					go func(sc *sshConn) {
+						defer wg.Done()
+						results <- probeResult{sc: sc, err: sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout)}
+					}(sc)
+				}
+				wg.Wait()
+				close(results)
+
+				failed := make(map[*sshConn]struct{})
+				for res := range results {
+					if res.err != nil {
+						log.Printf("[WARN] upstream %s: wake probe failed, removing connection (sshConn=%d): %v", g.name, res.sc.id, res.err)
+						failed[res.sc] = struct{}{}
+					}
+				}
+
+				if len(failed) > 0 {
+					var toClose []*sshConn
+					g.connsMu.Lock()
+					alive := make([]*sshConn, 0, len(g.conns))
+					for _, sc := range g.conns {
+						if _, dead := failed[sc]; dead {
+							toClose = append(toClose, sc)
+							continue
+						}
+						alive = append(alive, sc)
+					}
+					g.conns = alive
+					g.connsMu.Unlock()
+
+					g.signalCapacityChange()
+					g.notifyMaintain()
+
+					for _, sc := range toClose {
+						sshConnCloseHook(sc)
+					}
+				}
+			}
 		}
 	}
 	g.lastMaintainTime = now
@@ -1252,19 +1426,14 @@ func (g *Group) maintainOnce(now time.Time) {
 	var alive []*sshConn
 	removedAny := false
 	for _, sc := range g.conns {
-		if sc.adapter != nil {
-			select {
-			case <-sc.adapter.Done():
-				// Connection dead, close and skip.
-				log.Printf("[INFO] upstream %s: pool connection closed, removing (sshConn=%d)", g.name, sc.id)
-				if sc.sshClient != nil {
-					sc.sshClient.Close()
-				}
-				sc.adapter.Close()
-				removedAny = true
-			default:
-				alive = append(alive, sc)
-			}
+		select {
+		case <-sshConnDoneHook(sc):
+			// Connection dead, close and skip.
+			log.Printf("[INFO] upstream %s: pool connection closed, removing (sshConn=%d)", g.name, sc.id)
+			sshConnCloseHook(sc)
+			removedAny = true
+		default:
+			alive = append(alive, sc)
 		}
 	}
 	g.conns = alive

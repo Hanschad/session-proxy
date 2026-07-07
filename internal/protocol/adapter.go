@@ -1086,15 +1086,28 @@ func (a *Adapter) startPings() {
 			debugLog("Stopping ping loop - adapter closed")
 			return
 		case <-ticker.C:
-			deadline := time.Now().Add(writeWait)
-			a.writeMu.Lock()
-			err := a.conn.WriteControl(websocket.PingMessage, []byte("keepalive"), deadline)
-			a.writeMu.Unlock()
+			sendPing := func() error {
+				deadline := time.Now().Add(writeWait)
+				a.writeMu.Lock()
+				err := a.conn.WriteControl(websocket.PingMessage, []byte("keepalive"), deadline)
+				a.writeMu.Unlock()
+				return err
+			}
 
+			err := sendPing()
 			if err != nil {
-				debugLog("WebSocket Ping failed: %v, closing adapter to trigger reconnect", err)
-				a.closeWithError(fmt.Errorf("websocket ping failed: %w", err))
-				return
+				debugLog("WebSocket Ping failed (first attempt): %v", err)
+				if pingRetryErr := a.sleepWithWriteDeadline(500 * time.Millisecond); pingRetryErr != nil {
+					a.closeWithError(fmt.Errorf("websocket ping failed before retry: %w", err))
+					return
+				}
+
+				err = sendPing()
+				if err != nil {
+					debugLog("WebSocket Ping failed (retry): %v, closing adapter to trigger reconnect", err)
+					a.closeWithError(fmt.Errorf("websocket ping failed after retry: %w", err))
+					return
+				}
 			}
 			debugLog("WebSocket Ping sent")
 		}
