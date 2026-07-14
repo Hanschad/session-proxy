@@ -1,6 +1,6 @@
 module github.com/hanschad/session-proxy
 
-go 1.25.5
+go 1.26
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.41.0
@@ -13,7 +13,6 @@ require (
 	github.com/spf13/pflag v1.0.10
 	github.com/spf13/viper v1.21.0
 	golang.org/x/crypto v0.46.0
-	golang.org/x/term v0.38.0
 )
 
 require (
