@@ -206,7 +206,12 @@ func (a *Adapter) reconnectLoop(trigger error) {
 		a.reconnectGate = nil
 		a.reconnectMu.Unlock()
 		if gate != nil {
-			close(gate)
+			select {
+			case <-gate:
+				// Already closed by Adapter.Close().
+			default:
+				close(gate)
+			}
 		}
 	}()
 
@@ -243,19 +248,8 @@ func (a *Adapter) reconnectLoop(trigger error) {
 		cancel()
 		if err != nil {
 			debugLog("ResumeSession attempt %d failed: %v", attempt, err)
-			delay := retryer.NextDelay(attempt)
-			if delay > time.Until(deadline) {
-				delay = time.Until(deadline)
-			}
-			if delay <= 0 {
+			if !a.sleepResumeBackoff(retryer, attempt, deadline) {
 				break
-			}
-			timer := time.NewTimer(delay)
-			select {
-			case <-a.done:
-				timer.Stop()
-				return
-			case <-timer.C:
 			}
 			continue
 		}
@@ -265,26 +259,25 @@ func (a *Adapter) reconnectLoop(trigger error) {
 		dialCancel()
 		if err != nil {
 			debugLog("Resume websocket dial attempt %d failed: %v", attempt, err)
+			if !a.sleepResumeBackoff(retryer, attempt, deadline) {
+				break
+			}
 			continue
 		}
 
 		if err := a.sendOpenDataChannel(ws, token); err != nil {
 			_ = ws.Close()
 			debugLog("Resume OpenDataChannel attempt %d failed: %v", attempt, err)
+			if !a.sleepResumeBackoff(retryer, attempt, deadline) {
+				break
+			}
 			continue
 		}
 
 		gen := a.swapConn(ws)
 		a.markOutgoingForRetransmit()
 		a.clearPauseForReconnect()
-		if !a.handshakeComplete {
-			a.handshakeComplete = true
-			select {
-			case <-a.handshakeDone:
-			default:
-				close(a.handshakeDone)
-			}
-		}
+		a.markHandshakeComplete()
 
 		go a.readLoopForGen(gen)
 		go a.pingLoopForGen(gen)
@@ -297,6 +290,24 @@ func (a *Adapter) reconnectLoop(trigger error) {
 		_ = a.streamWriter.Close()
 	}
 	a.closeWithError(fmt.Errorf("%w: %v", errResumeBudgetExhausted, trigger))
+}
+
+func (a *Adapter) sleepResumeBackoff(retryer *retry.ExponentialRetryer, attempt int, deadline time.Time) bool {
+	delay := retryer.NextDelay(attempt)
+	if delay > time.Until(deadline) {
+		delay = time.Until(deadline)
+	}
+	if delay <= 0 {
+		return false
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-a.done:
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (a *Adapter) markOutgoingForRetransmit() {

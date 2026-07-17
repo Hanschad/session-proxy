@@ -222,6 +222,13 @@ func (g *Group) startSSHKeepalives(sc *sshConn) {
 			}
 
 			if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+				// An in-flight probe can fail because the WebSocket dropped underneath
+				// SSH. Do not count that against the connection while resume is running.
+				if sc.adapter != nil && sc.adapter.Reconnecting() {
+					debugLog("upstream %s: ignoring ssh keepalive failure during adapter resume (sshConn=%d): %v",
+						g.name, sc.id, err)
+					continue
+				}
 				failures := atomic.AddInt64(&sc.keepaliveConsecutiveFailures, 1)
 				if failures >= sshKeepaliveFailureLimit {
 					log.Printf("[WARN] upstream %s: ssh keepalive failed for connection (sshConn=%d failures=%d), closing connection: %v",

@@ -106,7 +106,6 @@ func TestAdapterHandshakeAndData(t *testing.T) {
 	}()
 
 	// 2. Connect Client
-	DebugMode = true
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

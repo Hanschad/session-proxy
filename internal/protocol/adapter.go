@@ -179,7 +179,8 @@ type Adapter struct {
 
 	// Handshake state
 	handshakeComplete     bool
-	handshakeResponded    bool // Track if we already responded to HandshakeRequest
+	handshakeOnce         sync.Once // closes handshakeDone exactly once
+	handshakeResponded    bool      // Track if we already responded to HandshakeRequest
 	handshakeDone         chan struct{}
 	lastHandshakeResponse *AgentMessage // Saved for retransmission
 
@@ -589,10 +590,8 @@ func (a *Adapter) resendLoop() {
 		a.outgoingMu.Unlock()
 
 		if err := a.writeRaw(data, MsgTypeInputStreamData, PayloadTypeOutput); err != nil {
+			// writeRaw retries across resume; a returned error means permanent close.
 			debugLog("Resend failed: seq=%d err=%v", seq, err)
-			if a.handleTransportFailure(fmt.Errorf("resend write failed: %w", err)) {
-				return
-			}
 			return
 		}
 	}
@@ -670,9 +669,7 @@ func (a *Adapter) handleHandshakeRequestPayload(msg *AgentMessage, isDuplicate b
 func (a *Adapter) handleHandshakeCompletePayload(msg *AgentMessage) {
 	debugLog("Received HandshakeComplete: %s", string(msg.Payload))
 
-	if !a.handshakeComplete {
-		a.handshakeComplete = true
-		close(a.handshakeDone)
+	if a.markHandshakeComplete() {
 		a.updateExpectedSeqNum(msg, "HandshakeComplete")
 	}
 
@@ -680,6 +677,18 @@ func (a *Adapter) handleHandshakeCompletePayload(msg *AgentMessage) {
 		debugLog("Ack Send Error: %v", err)
 		a.closeWithError(fmt.Errorf("send handshake complete ack: %w", err))
 	}
+}
+
+// markHandshakeComplete marks the SSM handshake as complete exactly once.
+// Returns true if this call performed the transition.
+func (a *Adapter) markHandshakeComplete() bool {
+	first := false
+	a.handshakeOnce.Do(func() {
+		a.handshakeComplete = true
+		close(a.handshakeDone)
+		first = true
+	})
+	return first
 }
 
 // updateExpectedSeqNum updates the expected sequence number after processing a message
@@ -775,35 +784,45 @@ func (a *Adapter) writeMessage(msg *AgentMessage) error {
 }
 
 func (a *Adapter) writeRaw(data []byte, msgType string, payloadType uint32) error {
-	if err := a.waitUntilConnected(); err != nil {
-		return err
-	}
-
-	a.writeMu.Lock()
-	defer a.writeMu.Unlock()
-
-	conn, gen := a.getConn()
-	if conn == nil {
-		return io.ErrClosedPipe
-	}
-
-	// SSM uses BinaryMessage for frames
-	_ = conn.SetWriteDeadline(a.effectiveWriteDeadline())
-	err := conn.WriteMessage(websocket.BinaryMessage, data)
-	if err != nil {
-		debugLog("WebSocket WriteMessage FAILED: gen=%d err=%v", gen, err)
-		if a.handleTransportFailure(err) {
+	for {
+		if err := a.waitUntilConnected(); err != nil {
 			return err
 		}
-		return err
-	}
 
-	// Logging every data frame is extremely noisy (and can become a bottleneck).
-	// Keep success logs for control frames, but always log failures above.
-	if msgType != MsgTypeAcknowledge && (msgType != MsgTypeInputStreamData || payloadType != PayloadTypeOutput) {
-		debugLog("WebSocket WriteMessage OK: %d bytes, MsgType=%q PayloadType=%d", len(data), msgType, payloadType)
+		a.writeMu.Lock()
+		if a.Reconnecting() {
+			a.writeMu.Unlock()
+			continue
+		}
+
+		conn, gen := a.getConn()
+		if conn == nil {
+			a.writeMu.Unlock()
+			return io.ErrClosedPipe
+		}
+
+		// SSM uses BinaryMessage for frames
+		_ = conn.SetWriteDeadline(a.effectiveWriteDeadline())
+		err := conn.WriteMessage(websocket.BinaryMessage, data)
+		if err != nil {
+			a.writeMu.Unlock()
+			debugLog("WebSocket WriteMessage FAILED: gen=%d err=%v", gen, err)
+			if a.handleTransportFailure(err) {
+				return err
+			}
+			// Resume in progress: wait for the new WebSocket and retry so callers
+			// (including crypto/ssh) never observe a transient transport error.
+			continue
+		}
+
+		// Logging every data frame is extremely noisy (and can become a bottleneck).
+		// Keep success logs for control frames, but always log failures above.
+		if msgType != MsgTypeAcknowledge && (msgType != MsgTypeInputStreamData || payloadType != PayloadTypeOutput) {
+			debugLog("WebSocket WriteMessage OK: %d bytes, MsgType=%q PayloadType=%d", len(data), msgType, payloadType)
+		}
+		a.writeMu.Unlock()
+		return nil
 	}
-	return nil
 }
 
 func (a *Adapter) nextSeq() int64 {
@@ -1007,6 +1026,15 @@ func (a *Adapter) Close() error {
 			close(a.done) // Signal that adapter is closed
 		}
 
+		// Unblock writers waiting on resume.
+		a.reconnectMu.Lock()
+		if a.reconnecting && a.reconnectGate != nil {
+			close(a.reconnectGate)
+			a.reconnectGate = nil
+		}
+		a.reconnecting = false
+		a.reconnectMu.Unlock()
+
 		// Wake any goroutines blocked on outgoing buffer backpressure.
 		a.outgoingMu.Lock()
 		a.outgoingClosed = true
@@ -1021,14 +1049,12 @@ func (a *Adapter) Close() error {
 		if a.streamWriter != nil {
 			_ = a.streamWriter.Close()
 		}
+		a.connMu.Lock()
 		if a.conn != nil {
-			a.connMu.Lock()
-			if a.conn != nil {
-				_ = a.conn.Close()
-				a.conn = nil
-			}
-			a.connMu.Unlock()
+			_ = a.conn.Close()
+			a.conn = nil
 		}
+		a.connMu.Unlock()
 	})
 	return nil
 }
@@ -1229,12 +1255,11 @@ func (a *Adapter) handleDataMessage(msg *AgentMessage) {
 	a.incomingMsgBufMu.Lock()
 	defer a.incomingMsgBufMu.Unlock()
 
-	// Always send ACK (even for out-of-order or duplicate messages)
+	// Always send ACK (even for out-of-order or duplicate messages).
+	// sendAck → writeRaw retries across resume, so a returned error is permanent.
 	if err := a.sendAck(msg); err != nil {
 		debugLog("Ack Send Error: %v", err)
-		if a.handleTransportFailure(fmt.Errorf("send data ack: %w", err)) {
-			return
-		}
+		a.closeWithError(fmt.Errorf("send data ack: %w", err))
 		return
 	}
 
