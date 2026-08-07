@@ -80,10 +80,26 @@ func TestPoolConnectParallelizesUpstreams(t *testing.T) {
 }
 
 func TestDialWaitForCapacityWakesOnSignal(t *testing.T) {
+	gctx, gcancel := context.WithCancel(context.Background())
 	g := &Group{
 		name:      "test",
 		instances: []string{"i-test-1"},
+		ctx:       gctx,
+		cancel:    gcancel,
 	}
+
+	// A saturated pool triggers scale-up goroutines; stub connection creation
+	// so they exit immediately, and wait for them before restoring the hook to
+	// avoid data races with subsequent tests.
+	origConnectSingle := groupConnectSingleHook
+	groupConnectSingleHook = func(g *Group, ctx context.Context, instanceID string) (*sshConn, error) {
+		return nil, errors.New("scale-up disabled in test")
+	}
+	defer func() {
+		gcancel()
+		g.bgWG.Wait()
+		groupConnectSingleHook = origConnectSingle
+	}()
 
 	sc := &sshConn{
 		id:    1,
@@ -287,7 +303,7 @@ func TestKeepaliveFailuresCloseAndRemoveConn(t *testing.T) {
 		}
 	}
 
-	g.startSSHKeepalives(sc)
+	stopped := g.startSSHKeepalives(sc)
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -304,11 +320,116 @@ func TestKeepaliveFailuresCloseAndRemoveConn(t *testing.T) {
 		t.Fatalf("expected connection to be closed once, got %d", got)
 	}
 
+	// Wait for the keepalive goroutine to exit before defers restore the hooks,
+	// otherwise the restore races with in-loop hook reads.
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive loop did not stop after connection close")
+	}
+
+	// Suppress replenishment: leaked replenish goroutines outlive the test and
+	// race with hook mutation in subsequent tests.
+	g.replenishMu.Lock()
+	g.replenishNextAttempt = time.Now().Add(time.Hour)
+	g.replenishMu.Unlock()
+
 	g.maintainOnce(time.Now())
 	g.connsMu.RLock()
 	defer g.connsMu.RUnlock()
 	if len(g.conns) != 0 {
 		t.Fatalf("expected closed connection to be removed from pool, still have %d", len(g.conns))
+	}
+}
+
+// TestKeepaliveFailureIgnoredWithRecentInbound verifies that a busy connection
+// (probe reply stuck behind bulk traffic) is not killed as long as the adapter
+// is still receiving data.
+func TestKeepaliveFailureIgnoredWithRecentInbound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+
+	sc := &sshConn{id: 43, group: g}
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	origProbe := sshConnKeepaliveProbeHook
+	origDone := sshConnDoneHook
+	origClose := sshConnCloseHook
+	origInterval := sshKeepaliveIntervalHook
+	origRecent := sshConnRecentInboundHook
+	defer func() {
+		sshConnKeepaliveProbeHook = origProbe
+		sshConnDoneHook = origDone
+		sshConnCloseHook = origClose
+		sshKeepaliveIntervalHook = origInterval
+		sshConnRecentInboundHook = origRecent
+	}()
+	sshKeepaliveIntervalHook = func() time.Duration { return 20 * time.Millisecond }
+
+	adapterDone := make(chan struct{})
+	sshConnDoneHook = func(target *sshConn) <-chan struct{} {
+		if target == sc {
+			return adapterDone
+		}
+		return nil
+	}
+
+	var probeCalls int64
+	sshConnKeepaliveProbeHook = func(target *sshConn, timeout time.Duration) error {
+		if target != sc {
+			return nil
+		}
+		atomic.AddInt64(&probeCalls, 1)
+		return errors.New("keepalive timed out")
+	}
+
+	sshConnRecentInboundHook = func(target *sshConn, window time.Duration) bool {
+		return target == sc
+	}
+
+	var closeCalls int64
+	sshConnCloseHook = func(target *sshConn) {
+		if target == sc {
+			atomic.AddInt64(&closeCalls, 1)
+		}
+	}
+
+	stopped := g.startSSHKeepalives(sc)
+
+	// Wait for well past the failure limit worth of probes.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&probeCalls) >= sshKeepaliveFailureLimit*3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if got := atomic.LoadInt64(&probeCalls); got < sshKeepaliveFailureLimit*3 {
+		t.Fatalf("expected at least %d keepalive probes, got %d", sshKeepaliveFailureLimit*3, got)
+	}
+	if got := atomic.LoadInt64(&closeCalls); got != 0 {
+		t.Fatalf("connection with recent inbound traffic must not be closed, got %d closes", got)
+	}
+	if got := atomic.LoadInt64(&sc.keepaliveConsecutiveFailures); got != 0 {
+		t.Fatalf("expected keepalive failure counter reset with recent inbound, got %d", got)
+	}
+
+	// Stop the loop and wait for it to exit before defers restore the hooks.
+	close(adapterDone)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive loop did not stop after adapter done")
 	}
 }
 

@@ -569,3 +569,43 @@ func TestPausePublication_BoundedTimeout(t *testing.T) {
 		t.Fatal("adapter was not closed after exceeding maxPauseTime; pause timeout behavior regression")
 	}
 }
+
+// TestProcessMessage_DropsNonOutputPayloads verifies that control payloads
+// (Flag, Error, ExitCode, ...) are never injected into the tunneled byte
+// stream. Injecting them corrupts the stream (e.g. SSH "banner exchange ...
+// invalid format" when garbage precedes the SSH identification string).
+func TestProcessMessage_DropsNonOutputPayloads(t *testing.T) {
+	pr, pw := net.Pipe()
+	defer pr.Close()
+	defer pw.Close()
+
+	a := &Adapter{streamWriter: pw}
+
+	banner := []byte("SSH-2.0-OpenSSH_9.7\r\n")
+	go func() {
+		a.processMessage(&AgentMessage{
+			Header:  AgentMessageHeader{MessageType: MsgTypeOutputStreamData, PayloadType: PayloadTypeFlag, SequenceNumber: 0},
+			Payload: []byte{0, 0, 0, 1},
+		})
+		a.processMessage(&AgentMessage{
+			Header:  AgentMessageHeader{MessageType: MsgTypeOutputStreamData, PayloadType: PayloadTypeError, SequenceNumber: 1},
+			Payload: []byte("Connection to destination port failed"),
+		})
+		a.processMessage(&AgentMessage{
+			Header:  AgentMessageHeader{MessageType: MsgTypeOutputStreamData, PayloadType: PayloadTypeOutput, SequenceNumber: 2},
+			Payload: banner,
+		})
+	}()
+
+	if err := pr.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	buf := make([]byte, 128)
+	n, err := pr.Read(buf)
+	if err != nil {
+		t.Fatalf("read from stream: %v", err)
+	}
+	if got := string(buf[:n]); got != string(banner) {
+		t.Fatalf("expected only output payload %q on stream, got %q", banner, got)
+	}
+}

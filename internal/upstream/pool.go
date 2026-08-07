@@ -194,12 +194,34 @@ const (
 	drainingConnHardCloseWait = 10 * time.Minute
 )
 
-func (g *Group) startSSHKeepalives(sc *sshConn) {
+var sshConnRecentInboundHook = func(sc *sshConn, window time.Duration) bool {
+	return sc.hasRecentInbound(window)
+}
+
+// hasRecentInbound reports whether the underlying SSM adapter received any
+// message within the given window. A saturated connection (e.g. a large HTTP
+// response through the tunnel) can delay keepalive replies past the probe
+// timeout; recent inbound traffic proves the transport is alive, so probes
+// must not evict such a connection.
+func (sc *sshConn) hasRecentInbound(window time.Duration) bool {
+	if sc == nil || sc.adapter == nil {
+		return false
+	}
+	last := sc.adapter.LastInbound()
+	return !last.IsZero() && time.Since(last) < window
+}
+
+// startSSHKeepalives starts the per-connection keepalive loop. The returned
+// channel is closed when the loop exits (used by tests to synchronize).
+func (g *Group) startSSHKeepalives(sc *sshConn) <-chan struct{} {
+	stopped := make(chan struct{})
 	if sc == nil {
-		return
+		close(stopped)
+		return stopped
 	}
 
 	go func() {
+		defer close(stopped)
 		ticker := time.NewTicker(sshKeepaliveIntervalHook())
 		defer ticker.Stop()
 
@@ -229,6 +251,14 @@ func (g *Group) startSSHKeepalives(sc *sshConn) {
 						g.name, sc.id, err)
 					continue
 				}
+				// A busy connection can starve the keepalive reply behind bulk
+				// traffic. Recent inbound data proves the transport is alive.
+				if sshConnRecentInboundHook(sc, sshKeepaliveProbeTimeout) {
+					debugLog("upstream %s: ignoring ssh keepalive failure, connection has recent inbound traffic (sshConn=%d): %v",
+						g.name, sc.id, err)
+					atomic.StoreInt64(&sc.keepaliveConsecutiveFailures, 0)
+					continue
+				}
 				failures := atomic.AddInt64(&sc.keepaliveConsecutiveFailures, 1)
 				if failures >= sshKeepaliveFailureLimit {
 					log.Printf("[WARN] upstream %s: ssh keepalive failed for connection (sshConn=%d failures=%d), closing connection: %v",
@@ -244,6 +274,7 @@ func (g *Group) startSSHKeepalives(sc *sshConn) {
 			atomic.StoreInt64(&sc.keepaliveConsecutiveFailures, 0)
 		}
 	}()
+	return stopped
 }
 
 // closeDrainingConns waits for each connection to become idle (or timeout) and closes it.
@@ -266,7 +297,8 @@ func (g *Group) closeDrainingConns(conns []*sshConn, timeout time.Duration) {
 			}
 
 			if now.After(softDeadline) {
-				if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+				if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil &&
+					!sshConnRecentInboundHook(sc, sshKeepaliveProbeTimeout) {
 					log.Printf("[WARN] upstream %s: force-closing unhealthy draining connection (sshConn=%d): %v", g.name, sc.id, err)
 					sshConnCloseHook(sc)
 					break
@@ -342,6 +374,10 @@ type Group struct {
 	ssmClient *ssm.Client
 
 	maintainCh chan struct{}
+
+	// bgWG tracks background goroutines (maintain loop, replenish and scale-up
+	// attempts) so Close can wait for them to finish.
+	bgWG sync.WaitGroup
 
 	// Serialize pool growth calculations and bound concurrent SSM+SSH session creation.
 	scaleMu       sync.Mutex
@@ -622,7 +658,12 @@ func (p *Pool) Connect(ctx context.Context) error {
 	for _, res := range connected {
 		log.Printf("[INFO] Upstream %q connected via instance %s", res.name, res.group.currentInstance())
 		res.group.ctx, res.group.cancel = context.WithCancel(ctx)
-		go res.group.maintain()
+		g := res.group
+		g.bgWG.Add(1)
+		go func() {
+			defer g.bgWG.Done()
+			g.maintain()
+		}()
 	}
 
 	return nil
@@ -796,7 +837,9 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 		g.name, add, poolSize, g.scaleInFlight, connID, addr)
 
 	for i := 0; i < add; i++ {
+		g.bgWG.Add(1)
 		go func() {
+			defer g.bgWG.Done()
 			defer func() {
 				g.scaleMu.Lock()
 				g.scaleInFlight--
@@ -1093,7 +1136,8 @@ func (g *Group) maybeForceReconnect(sc *sshConn, reason string) {
 	go func() {
 		defer atomic.StoreInt32(&g.forcedReconnectInProgress, 0)
 
-		if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil {
+		if err := sshConnKeepaliveProbeHook(sc, sshKeepaliveProbeTimeout); err != nil &&
+			!sshConnRecentInboundHook(sc, sshKeepaliveProbeTimeout) {
 			log.Printf("[WARN] upstream %s: draining connection failed keepalive probe, evicting (sshConn=%d): %v", g.name, sc.id, err)
 			g.connsMu.Lock()
 			g.removeConn(sc)
@@ -1410,6 +1454,10 @@ func (g *Group) maintainOnce(now time.Time) {
 				failed := make(map[*sshConn]struct{})
 				for res := range results {
 					if res.err != nil {
+						if sshConnRecentInboundHook(res.sc, sshKeepaliveProbeTimeout) {
+							log.Printf("[INFO] upstream %s: wake probe failed but connection has recent inbound traffic, keeping (sshConn=%d): %v", g.name, res.sc.id, res.err)
+							continue
+						}
 						log.Printf("[WARN] upstream %s: wake probe failed, removing connection (sshConn=%d): %v", g.name, res.sc.id, res.err)
 						failed[res.sc] = struct{}{}
 					}
@@ -1486,7 +1534,11 @@ func (g *Group) maintainOnce(now time.Time) {
 
 		for i := 0; i < needed; i++ {
 			attemptID := atomic.AddUint64(&g.replenishAttemptID, 1)
-			go g.replenishOnce(instance, attemptID)
+			g.bgWG.Add(1)
+			go func() {
+				defer g.bgWG.Done()
+				g.replenishOnce(instance, attemptID)
+			}()
 		}
 	}
 }
@@ -1517,5 +1569,11 @@ func (p *Pool) Close() {
 		g.connsMu.Lock()
 		g.cleanup()
 		g.connsMu.Unlock()
+	}
+
+	// Wait for background goroutines (maintain/replenish/scale-up) to observe
+	// cancellation and exit, so nothing keeps dialing after Close returns.
+	for _, g := range p.groups {
+		g.bgWG.Wait()
 	}
 }

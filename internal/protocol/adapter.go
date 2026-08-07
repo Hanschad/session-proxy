@@ -199,7 +199,23 @@ type Adapter struct {
 	closeReasonMu sync.Mutex
 	closeReason   error // first error wins
 
+	// lastInboundUnixNano records when the last SSM message arrived. Liveness
+	// probes (SSH keepalive) consult this so a connection that is actively
+	// receiving data is never treated as dead just because a probe reply is
+	// stuck behind bulk traffic.
+	lastInboundUnixNano atomic.Int64
+
 	clientId string // stable OpenDataChannel client id across resume
+}
+
+// LastInbound returns when the adapter last received any SSM message.
+// The zero time means nothing has been received yet.
+func (a *Adapter) LastInbound() time.Time {
+	ns := a.lastInboundUnixNano.Load()
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // ClientVersion is the SSM protocol version reported to AWS SSM service.
@@ -297,6 +313,8 @@ func NewAdapter(ctx context.Context, streamUrl, token string, opts ...AdapterOpt
 
 // dispatchMessage routes message to appropriate handler. Returns false if channel closed.
 func (a *Adapter) dispatchMessage(msg *AgentMessage) bool {
+	a.lastInboundUnixNano.Store(time.Now().UnixNano())
+
 	isDuplicate := a.markMessageSeen(msg.Header.MessageId, msg.Header.SequenceNumber)
 
 	switch msg.Header.MessageType {
@@ -1299,7 +1317,16 @@ func (a *Adapter) processBufferedMessages() {
 }
 
 // processMessage writes the message payload to the pipe.
+// Only PayloadTypeOutput carries stream bytes for port sessions. Control payloads
+// (Flag, Error, ExitCode, ...) still consume a sequence number and must be ACKed,
+// but writing them into the stream would corrupt the tunneled byte stream
+// (e.g. SSH "banner exchange ... invalid format").
 func (a *Adapter) processMessage(msg *AgentMessage) {
+	if msg.Header.PayloadType != PayloadTypeOutput {
+		log.Printf("[WARN] ignoring non-output payload in stream: type=%d len=%d seq=%d",
+			msg.Header.PayloadType, len(msg.Payload), msg.Header.SequenceNumber)
+		return
+	}
 	if a.streamWriter == nil {
 		return
 	}
