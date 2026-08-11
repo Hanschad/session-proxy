@@ -417,6 +417,9 @@ type Group struct {
 	replenishSuccessTotal  uint64
 	replenishFailureTotal  uint64
 	pendingAbandonedDials  int64
+
+	// Rate limit for capacity-starvation warnings.
+	lastCapacityWarnUnixNano int64
 }
 
 // NewPool creates a new upstream pool from configuration.
@@ -791,6 +794,51 @@ func (g *Group) selectConnWithCapacity() *sshConn {
 	return candidates[idx]
 }
 
+// logCapacityStarvation emits a rate-limited WARN explaining why dials are
+// queueing. Scale-up refusal is otherwise silent (e.g. pool at hard cap), which
+// makes mass "dial wait for capacity" errors undiagnosable from logs alone.
+func (g *Group) logCapacityStarvation(connID uint64, addr string) {
+	const warnInterval = 5 * time.Second
+
+	now := time.Now().UnixNano()
+	last := atomic.LoadInt64(&g.lastCapacityWarnUnixNano)
+	if last != 0 && time.Duration(now-last) < warnInterval {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&g.lastCapacityWarnUnixNano, last, now) {
+		return
+	}
+
+	g.connsMu.RLock()
+	poolSize := len(g.conns)
+	var active, inflight int64
+	draining := 0
+	for _, sc := range g.conns {
+		active += atomic.LoadInt64(&sc.activeChannels)
+		inflight += atomic.LoadInt64(&sc.inflightDials)
+		if sc.isDraining() {
+			draining++
+		}
+	}
+	g.connsMu.RUnlock()
+
+	g.scaleMu.Lock()
+	scaleInFlight := g.scaleInFlight
+	g.scaleMu.Unlock()
+
+	reason := "scale-up in progress"
+	switch {
+	case poolSize+scaleInFlight >= maxPoolSize:
+		reason = "pool at hard cap, scale-up refused"
+	case scaleInFlight >= scaleParallelism:
+		reason = "scale-up parallelism saturated"
+	}
+
+	log.Printf("[WARN] upstream %s: dials waiting for capacity (%s): pool=%d/%d active=%d inflight=%d draining=%d abandoned=%d scaleInFlight=%d (conn=%d target=%s)",
+		g.name, reason, poolSize, maxPoolSize, active, inflight, draining,
+		atomic.LoadInt64(&g.pendingAbandonedDials), scaleInFlight, connID, addr)
+}
+
 // startScaleIfNeeded tries to grow the pool when all current connections are at
 // capacity. It returns true if it started any new connection attempts.
 func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
@@ -833,7 +881,7 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 	atomic.AddUint64(&g.scaleStartsTotal, uint64(add))
 	instance := g.currentInstance()
 
-	debugLog("upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
+	log.Printf("[INFO] upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
 		g.name, add, poolSize, g.scaleInFlight, connID, addr)
 
 	for i := 0; i < add; i++ {
@@ -907,11 +955,10 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		if !waitLogged {
 			waitLogged = true
 			atomic.AddUint64(&g.dialWaitsTotal, 1)
-			debugLog("upstream %s: dial waiting for capacity conn=%d addr=%s (pool=%d maxPool=%d)",
-				g.name, connID, addr, poolSize, maxPoolSize)
 		}
 
 		_ = g.startScaleIfNeeded(connID, addr)
+		g.logCapacityStarvation(connID, addr)
 
 		if g.selectConnWithCapacity() != nil {
 			continue
