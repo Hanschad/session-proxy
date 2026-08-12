@@ -169,6 +169,13 @@ func (a *Adapter) waitUntilConnected() error {
 // handleTransportFailure initiates resume when enabled. Returns true if the
 // adapter is permanently closing.
 func (a *Adapter) handleTransportFailure(err error) bool {
+	// A deliberate Close() also surfaces as a transport error to the read/ping
+	// loops; do not start (or log) a resume for an already-closed adapter.
+	select {
+	case <-a.done:
+		return true
+	default:
+	}
 	if !a.resumeEnabled() {
 		if a.streamWriter != nil {
 			_ = a.streamWriter.Close()
@@ -181,6 +188,11 @@ func (a *Adapter) handleTransportFailure(err error) bool {
 }
 
 func (a *Adapter) startReconnect(trigger error) {
+	select {
+	case <-a.done:
+		return
+	default:
+	}
 	if !a.resumeEnabled() {
 		return
 	}

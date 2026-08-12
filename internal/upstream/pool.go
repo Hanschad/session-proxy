@@ -65,6 +65,12 @@ var sshKeepaliveIntervalHook = func() time.Duration {
 	return sshKeepaliveInterval
 }
 
+var sshConnForceResumeHook = func(sc *sshConn) {
+	if sc != nil && sc.adapter != nil {
+		sc.adapter.ForceCloseTransport()
+	}
+}
+
 // Pool manages multiple upstream connections.
 type Pool struct {
 	groups map[string]*Group
@@ -135,6 +141,11 @@ type sshConn struct {
 	draining int32 // atomic: 1 = draining (no new channels), 0 = normal
 
 	keepaliveConsecutiveFailures int64
+
+	// lastKeepaliveRescueUnixNano records when a keepalive failure last forced a
+	// WebSocket resume on this connection, so we only rescue once per cooldown
+	// window before falling back to eviction.
+	lastKeepaliveRescueUnixNano int64
 }
 
 func (sc *sshConn) markDraining() {
@@ -192,6 +203,12 @@ const (
 	sshKeepaliveProbeTimeout  = 10 * time.Second
 	sshKeepaliveFailureLimit  = 2
 	drainingConnHardCloseWait = 10 * time.Minute
+
+	// keepaliveRescueCooldown limits how often a keepalive failure may force a
+	// WebSocket resume instead of evicting the connection. A half-dead SSM
+	// WebSocket with healthy SSH state is recoverable via resume; if the resume
+	// did not help, the next failure within the window evicts as before.
+	keepaliveRescueCooldown = 10 * time.Minute
 )
 
 var sshConnRecentInboundHook = func(sc *sshConn, window time.Duration) bool {
@@ -261,6 +278,20 @@ func (g *Group) startSSHKeepalives(sc *sshConn) <-chan struct{} {
 				}
 				failures := atomic.AddInt64(&sc.keepaliveConsecutiveFailures, 1)
 				if failures >= sshKeepaliveFailureLimit {
+					// Before evicting, try a transparent WebSocket resume: the SSM
+					// transport may be half-dead while SSH state is fine. Only once
+					// per cooldown window; if resume fails the adapter closes itself
+					// and this loop exits via the adapter-done channel.
+					now := time.Now()
+					lastRescue := atomic.LoadInt64(&sc.lastKeepaliveRescueUnixNano)
+					if sc.adapter != nil && (lastRescue == 0 || now.Sub(time.Unix(0, lastRescue)) >= keepaliveRescueCooldown) {
+						log.Printf("[WARN] upstream %s: ssh keepalive failed, forcing websocket resume before eviction (sshConn=%d failures=%d): %v",
+							g.name, sc.id, failures, err)
+						atomic.StoreInt64(&sc.lastKeepaliveRescueUnixNano, now.UnixNano())
+						atomic.StoreInt64(&sc.keepaliveConsecutiveFailures, 0)
+						sshConnForceResumeHook(sc)
+						continue
+					}
 					log.Printf("[WARN] upstream %s: ssh keepalive failed for connection (sshConn=%d failures=%d), closing connection: %v",
 						g.name, sc.id, failures, err)
 					sshConnCloseHook(sc)
@@ -335,6 +366,16 @@ const (
 
 	// replenishTimeout bounds a single replenish attempt to avoid blocking maintenance.
 	replenishTimeout = 60 * time.Second
+
+	// proactiveScaleHeadroom triggers background scale-up when pool-wide free
+	// channel slots drop to this value or below, so bursts do not have to wait
+	// for a full StartSession+WebSocket+SSH round trip.
+	proactiveScaleHeadroom = 2
+
+	// startSessionStepTimeout bounds the SSM StartSession API call within a
+	// single connect attempt. The AWS SDK's internal retries can otherwise take
+	// ~30s+ during a network outage, delaying recovery once the network returns.
+	startSessionStepTimeout = 20 * time.Second
 )
 
 type trackedConn struct {
@@ -848,6 +889,34 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 		return false
 	}
 
+	return g.startScale(connID, addr, "saturated")
+}
+
+// maybeScaleForHeadroom triggers a background scale-up while capacity still
+// exists, so a request burst does not have to wait ~5s for StartSession+WS+SSH
+// (clients typically time out before that). Cheap: one RLock over ≤ maxPoolSize
+// conns.
+func (g *Group) maybeScaleForHeadroom(connID uint64, addr string) {
+	g.connsMu.RLock()
+	poolSize := len(g.conns)
+	var used int64
+	for _, sc := range g.conns {
+		used += atomic.LoadInt64(&sc.activeChannels) + atomic.LoadInt64(&sc.inflightDials)
+	}
+	g.connsMu.RUnlock()
+
+	freeSlots := int64(poolSize*maxChannelsPerConn) - used
+	if freeSlots > proactiveScaleHeadroom {
+		return
+	}
+
+	_ = g.startScale(connID, addr, "proactive headroom")
+}
+
+// startScale grows the pool by starting background connection attempts, bounded
+// by maxPoolSize and scaleParallelism. It returns true if it started any new
+// connection attempts.
+func (g *Group) startScale(connID uint64, addr string, reason string) bool {
 	g.scaleMu.Lock()
 	defer g.scaleMu.Unlock()
 
@@ -881,8 +950,8 @@ func (g *Group) startScaleIfNeeded(connID uint64, addr string) bool {
 	atomic.AddUint64(&g.scaleStartsTotal, uint64(add))
 	instance := g.currentInstance()
 
-	log.Printf("[INFO] upstream %s: pool saturated, scaling up by %d (pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
-		g.name, add, poolSize, g.scaleInFlight, connID, addr)
+	log.Printf("[INFO] upstream %s: scaling up by %d (reason=%s pool=%d inflightScale=%d) (trigger conn=%d target=%s)",
+		g.name, add, reason, poolSize, g.scaleInFlight, connID, addr)
 
 	for i := 0; i < add; i++ {
 		g.bgWG.Add(1)
@@ -978,6 +1047,10 @@ func (g *Group) dial(ctx context.Context, network, addr string) (net.Conn, error
 		}
 	}
 	atomic.AddUint64(&g.dialAttemptsTotal, 1)
+
+	// Scale proactively while some capacity remains, instead of only when a
+	// dial finds the pool fully saturated.
+	g.maybeScaleForHeadroom(connID, addr)
 
 	if sc == nil || sc.sshClient == nil {
 		g.releaseInflight(sc)
@@ -1107,11 +1180,17 @@ func isTransportError(err error) bool {
 	if errors.Is(err, net.ErrClosed) {
 		return true
 	}
+	if errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
 	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
 		return true
 	}
 	msg := err.Error()
 	if strings.Contains(msg, "use of closed network connection") {
+		return true
+	}
+	if strings.Contains(msg, "closed pipe") {
 		return true
 	}
 	if strings.Contains(msg, "ssh: unexpected packet") ||
@@ -1279,9 +1358,13 @@ func (g *Group) connectSingle(ctx context.Context, instanceID string) (*sshConn,
 	log.Printf("[INFO] upstream %s: starting SSM session to %s (region=%s)...",
 		g.name, instanceID, ssmClient.Region())
 
-	// Start SSM session
+	// Start SSM session. Bound this step with its own timeout: the AWS SDK's
+	// internal retries can stretch a single call past 30s during a network
+	// outage. Later steps (WebSocket, SSM handshake, SSH) have their own bounds.
 	stepStart = time.Now()
-	session, err := ssmClient.StartSession(ctx, instanceID)
+	startSessionCtx, cancelStartSession := context.WithTimeout(ctx, startSessionStepTimeout)
+	session, err := ssmClient.StartSession(startSessionCtx, instanceID)
+	cancelStartSession()
 	if err != nil {
 		return nil, fmt.Errorf("start session: %w", err)
 	}

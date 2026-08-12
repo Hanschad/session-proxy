@@ -129,6 +129,50 @@ func TestDialWaitForCapacityWakesOnSignal(t *testing.T) {
 	}
 }
 
+// TestProactiveScaleOnLowHeadroom verifies that the pool scales up in the
+// background before it is fully saturated, once free slots drop to the
+// proactive headroom threshold.
+func TestProactiveScaleOnLowHeadroom(t *testing.T) {
+	gctx, gcancel := context.WithCancel(context.Background())
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+		ctx:       gctx,
+		cancel:    gcancel,
+	}
+
+	origConnectSingle := groupConnectSingleHook
+	groupConnectSingleHook = func(g *Group, ctx context.Context, instanceID string) (*sshConn, error) {
+		return nil, errors.New("scale-up disabled in test")
+	}
+	defer func() {
+		gcancel()
+		g.bgWG.Wait()
+		groupConnectSingleHook = origConnectSingle
+	}()
+
+	sc := &sshConn{id: 1, group: g}
+	// 1 conn with 3 active channels: freeSlots = 4-3 = 1 <= proactiveScaleHeadroom.
+	atomic.StoreInt64(&sc.activeChannels, maxChannelsPerConn-1)
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	g.maybeScaleForHeadroom(0, "10.0.0.1:80")
+
+	if got := atomic.LoadUint64(&g.scaleStartsTotal); got != 1 {
+		t.Fatalf("expected proactive scale to start 1 connection attempt, got %d", got)
+	}
+
+	// With ample free capacity no proactive scale-up should start.
+	atomic.StoreInt64(&sc.activeChannels, 0) // freeSlots = 4 > headroom
+	g.maybeScaleForHeadroom(0, "10.0.0.1:80")
+
+	if got := atomic.LoadUint64(&g.scaleStartsTotal); got != 1 {
+		t.Fatalf("expected no additional scale start with free headroom, got %d", got)
+	}
+}
+
 func TestGetSSMClientReusesClientAcrossCallers(t *testing.T) {
 	g := &Group{
 		awsCfg: config.AWSConfig{
@@ -339,6 +383,115 @@ func TestKeepaliveFailuresCloseAndRemoveConn(t *testing.T) {
 	defer g.connsMu.RUnlock()
 	if len(g.conns) != 0 {
 		t.Fatalf("expected closed connection to be removed from pool, still have %d", len(g.conns))
+	}
+}
+
+// TestKeepaliveFailureForcesResumeBeforeClose verifies that hitting the
+// keepalive failure limit first forces a WebSocket resume (once per cooldown
+// window) and only closes the connection when the limit is hit again while the
+// rescue window is already used.
+func TestKeepaliveFailureForcesResumeBeforeClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	g := &Group{
+		name:      "test",
+		instances: []string{"i-test-1"},
+		ctx:       ctx,
+		cancel:    cancel,
+	}
+
+	// A non-nil adapter marks the connection as resume-capable.
+	sc := &sshConn{id: 44, group: g, adapter: &protocol.Adapter{}}
+	g.connsMu.Lock()
+	g.conns = []*sshConn{sc}
+	g.connsMu.Unlock()
+
+	origProbe := sshConnKeepaliveProbeHook
+	origDone := sshConnDoneHook
+	origClose := sshConnCloseHook
+	origInterval := sshKeepaliveIntervalHook
+	origRecent := sshConnRecentInboundHook
+	origForce := sshConnForceResumeHook
+	defer func() {
+		sshConnKeepaliveProbeHook = origProbe
+		sshConnDoneHook = origDone
+		sshConnCloseHook = origClose
+		sshKeepaliveIntervalHook = origInterval
+		sshConnRecentInboundHook = origRecent
+		sshConnForceResumeHook = origForce
+	}()
+	sshKeepaliveIntervalHook = func() time.Duration { return 20 * time.Millisecond }
+
+	adapterDone := make(chan struct{})
+	sshConnDoneHook = func(target *sshConn) <-chan struct{} {
+		if target == sc {
+			return adapterDone
+		}
+		return nil
+	}
+
+	sshConnRecentInboundHook = func(target *sshConn, window time.Duration) bool {
+		return false
+	}
+
+	sshConnKeepaliveProbeHook = func(target *sshConn, timeout time.Duration) error {
+		if target != sc {
+			return nil
+		}
+		return errors.New("keepalive failed")
+	}
+
+	var forceCalls int64
+	sshConnForceResumeHook = func(target *sshConn) {
+		if target == sc {
+			atomic.AddInt64(&forceCalls, 1)
+		}
+	}
+
+	var closeCalls int64
+	var forceCallsAtClose int64
+	sshConnCloseHook = func(target *sshConn) {
+		if target == sc {
+			atomic.StoreInt64(&forceCallsAtClose, atomic.LoadInt64(&forceCalls))
+			atomic.AddInt64(&closeCalls, 1)
+			select {
+			case <-adapterDone:
+			default:
+				close(adapterDone)
+			}
+		}
+	}
+
+	stopped := g.startSSHKeepalives(sc)
+
+	// First time the limit is hit: force-resume fires, counter resets, no close.
+	// Second time (rescue window already used, cooldown is 10 minutes): close.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&closeCalls) >= 1 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("keepalive loop did not stop after connection close")
+	}
+
+	if got := atomic.LoadInt64(&forceCalls); got != 1 {
+		t.Fatalf("expected exactly one forced resume, got %d", got)
+	}
+	if got := atomic.LoadInt64(&closeCalls); got != 1 {
+		t.Fatalf("expected exactly one close, got %d", got)
+	}
+	if got := atomic.LoadInt64(&forceCallsAtClose); got != 1 {
+		t.Fatalf("expected forced resume to fire before close (forceCalls at close = %d)", got)
+	}
+	if last := atomic.LoadInt64(&sc.lastKeepaliveRescueUnixNano); last == 0 {
+		t.Fatal("expected rescue timestamp to be recorded")
 	}
 }
 
@@ -883,6 +1036,9 @@ func TestIsTransportError(t *testing.T) {
 		{"broken pipe", syscall.EPIPE, true},
 		{"connection reset", syscall.ECONNRESET, true},
 		{"closed connection", fmt.Errorf("use of closed network connection"), true},
+		{"io.ErrClosedPipe", io.ErrClosedPipe, true},
+		{"wrapped closed pipe", fmt.Errorf("dial: %w", io.ErrClosedPipe), true},
+		{"closed pipe string", fmt.Errorf("io: read/write on closed pipe"), true},
 		{"ssh unexpected packet", fmt.Errorf("ssh: unexpected packet"), true},
 		{"ssh disconnect", fmt.Errorf("ssh: disconnect, reason 11:"), true},
 		{"ssh handshake failed", fmt.Errorf("ssh: handshake failed"), true},

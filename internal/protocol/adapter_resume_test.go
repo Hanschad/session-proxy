@@ -299,6 +299,36 @@ func TestAdapterResume_BudgetExhaustedClosesAdapter(t *testing.T) {
 	}
 }
 
+// TestAdapterResume_ClosedAdapterDoesNotStartResume verifies that a transport
+// failure surfacing after a deliberate Close() does not start (or log) a
+// resume attempt.
+func TestAdapterResume_ClosedAdapterDoesNotStartResume(t *testing.T) {
+	var resumeCalls atomic.Int32
+	a := &Adapter{
+		done: make(chan struct{}),
+		resumeFunc: func(context.Context) (string, string, error) {
+			resumeCalls.Add(1)
+			return "", "", errors.New("must not be called")
+		},
+	}
+	_ = a.Close()
+
+	if !a.handleTransportFailure(errors.New("read tcp: use of closed network connection")) {
+		t.Fatal("expected handleTransportFailure to report permanent close for closed adapter")
+	}
+	if a.Reconnecting() {
+		t.Fatal("closed adapter must not enter reconnecting state")
+	}
+
+	a.startReconnect(errors.New("trigger"))
+	if a.Reconnecting() {
+		t.Fatal("startReconnect on closed adapter must not start resume")
+	}
+	if resumeCalls.Load() != 0 {
+		t.Fatal("resume func must not be called on closed adapter")
+	}
+}
+
 func TestAdapterResume_ChannelClosedDoesNotResume(t *testing.T) {
 	var resumeCalls atomic.Int32
 
